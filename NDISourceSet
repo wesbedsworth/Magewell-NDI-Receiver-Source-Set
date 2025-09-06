@@ -10,7 +10,7 @@
 -----------------------------------------------------
 property sessionCookie : ""
 property configFileName : "NDIReceiverConfig.json"
-property debugMode : true -- Enable debug mode
+property debugMode : false -- Enable debug mode
 
 
 -----------------------------------------------------
@@ -73,104 +73,15 @@ set summaryResults to {}
 repeat with i from 1 to count of receiverList
 	set receiverIP to item i of receiverList
 	
-	-- Initialize a record to store the result for this receiver
-	set receiverResult to {receiver:receiverIP, status:"", source:""}
+	-- Update progress text
+	set progressText to "Processing receiver " & i & " of " & (count of receiverList) & ": " & receiverIP
+	my debugOutput(progressText)
 	
-	-- Reset session cookie for each new receiver
-	set sessionCookie to ""
+	-- Process the receiver using our modular function
+	set receiverResult to processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
 	
-	try
-		-- Debug marker BEFORE availability check
-		debugOutput("STEP A: Checking receiver availability for " & receiverIP)
-		set startTime to current date
-		
-		-- (A) Check if receiver is available (both network and API)
-		set availabilityStatus to checkReceiverAvailability(receiverIP, jqPath)
-		
-		-- Debug marker AFTER availability check
-		set endTime to current date
-		set elapsedSeconds to endTime - startTime
-		debugOutput("Availability check completed in " & elapsedSeconds & " seconds.")
-		debugOutput("Availability result: reachable=" & availabilityStatus's reachable & ", apiAvailable=" & availabilityStatus's apiAvailable)
-		
-		if not availabilityStatus's reachable then
-			set receiverResult's status to "Unreachable (network ping failed)"
-			set receiverResult's source to "N/A"
-			debugOutput("Device unreachable at " & receiverIP & ": " & availabilityStatus's message)
-			error "Skipping receiver " & receiverIP & " - network unreachable"
-		else if not availabilityStatus's apiAvailable then
-			set receiverResult's status to "API unavailable"
-			set receiverResult's source to "N/A"
-			debugOutput("API unavailable for " & receiverIP & ": " & availabilityStatus's message)
-			error "Skipping receiver " & receiverIP & " - API unavailable"
-		end if
-		
-		-- Debug marker BEFORE login
-		debugOutput("STEP B: Logging in to " & receiverIP & " and retrieving session cookie.")
-		
-		-- (B) Login to the receiver using session cookie management
-		set loginResponse to loginToReceiver(receiverIP, userName, userPW, connectTimeout)
-		debugOutput("Login Response for " & receiverIP & ": " & loginResponse)
-		checkResponse(loginResponse, "Login failed for receiver " & receiverIP, jqPath)
-		
-		-- Debug marker BEFORE source retrieval
-		debugOutput("STEP C: Retrieving sources from " & receiverIP)
-		
-		-- (C) Retrieve the list of available sources using session cookie
-		set getSourcesURL to "http://" & receiverIP & "/mwapi?method=get-ndi-sources"
-		set jsonResponse to runCURLWithSession(getSourcesURL, connectTimeout)
-		debugOutput("NDI Sources JSON response for " & receiverIP & ": " & jsonResponse)
-		checkResponse(jsonResponse, "Failed to retrieve sources for receiver " & receiverIP, jqPath)
-		
-		-- Debug marker BEFORE source filtering
-		debugOutput("STEP D: Filtering sources for " & receiverIP)
-		
-		-- (D) Use jq to filter sources for the desired receiver IP
-		set desiredIP to receiverIP
-		set jqQuery to ".sources[] | select(.\"ndi-name\" | contains(\"" & desiredIP & "\"))"
-		set targetSourceRaw to do shell script "echo " & quoted form of jsonResponse & " | " & jqPath & " '" & jqQuery & "'"
-		debugOutput("Target source for " & receiverIP & " obtained via jq: " & targetSourceRaw)
-		
-		if targetSourceRaw is not "" then
-			-- Debug marker BEFORE source extraction
-			debugOutput("STEP E: Extracting NDI name for " & receiverIP)
-			
-			-- (E) Extract the ndi-name field using jq and remove extra quotes, then URL encode the name
-			set ndiNameRaw to do shell script "echo " & quoted form of targetSourceRaw & " | " & jqPath & " '.\"ndi-name\"' | tr -d '\"'"
-			debugOutput("NDI Name for " & receiverIP & ": " & ndiNameRaw)
-			set encodedNdiName to urlEncode(ndiNameRaw)
-			debugOutput("Encoded NDI Name for " & receiverIP & ": " & encodedNdiName)
-			
-			-- Debug marker BEFORE channel setting
-			debugOutput("STEP F: Setting channel for " & receiverIP)
-			
-			-- (F) Set the receiver's channel to the found source
-			set setChannelURL to "http://" & receiverIP & "/mwapi?method=set-channel&ndi-name=true&name=" & encodedNdiName
-			set setChannelResponse to runCURLWithSession(setChannelURL, connectTimeout)
-			debugOutput("Set Channel Response for " & receiverIP & ": " & setChannelResponse)
-			checkResponse(setChannelResponse, "Set channel for receiver " & receiverIP, jqPath)
-			
-			set receiverResult's status to "Success"
-			set receiverResult's source to ndiNameRaw
-		else
-			set receiverResult's status to "Fail (No valid source found)"
-			set receiverResult's source to "N/A"
-		end if
-		
-		-- Debug marker BEFORE logout
-		debugOutput("STEP G: Logging out from " & receiverIP)
-		
-		-- (G) Logout from the receiver
-		set logoutURL to "http://" & receiverIP & "/mwapi?method=logout"
-		runCURLWithSession(logoutURL, connectTimeout)
-		
-	on error errMsg
-		debugOutput("ERROR processing receiver " & receiverIP & ": " & errMsg)
-	end try
-	
-	-- Append the result for this receiver to the summaryResults list
+	-- Append the result to the summaryResults list
 	set end of summaryResults to receiverResult
-	debugOutput("Finished processing receiver: " & receiverIP)
 end repeat
 
 
@@ -179,19 +90,64 @@ set endTimeSeconds to do shell script "date +%s"
 set elapsedSeconds to (endTimeSeconds as number) - (startTimeSeconds as number)
 set elapsedFormatted to my formatSeconds(elapsedSeconds)
 
--- Build and Display the Summary Dialog
-my debugOutput("Preparing summary report")
-set summaryText to "NDI Receiver Summary:" & return & return
-set summaryText to summaryText & "Total time: " & elapsedFormatted & return & return
+
+-- Analyze the overall status
+set totalReceivers to count of summaryResults
+set successCount to 0
+set failCount to 0
 
 repeat with res in summaryResults
+	if res's status starts with "Success" then
+		set successCount to successCount + 1
+	else
+		set failCount to failCount + 1
+	end if
+end repeat
+
+-- Determine the appropriate icon based on success/failure ratio
+set dialogIcon to missing value
+set statusSummary to ""
+
+if successCount = totalReceivers then
+	-- All receivers succeeded
+	set dialogIcon to note
+	set statusSummary to "✅ All receivers configured successfully."
+else if successCount > 0 then
+	-- Some receivers succeeded
+	set dialogIcon to caution
+	set statusSummary to "⚠️ " & successCount & " of " & totalReceivers & " receivers configured successfully."
+else
+	-- No receivers succeeded
+	set dialogIcon to stop
+	set statusSummary to "❌ Failed to configure any receivers."
+end if
+
+-- Build and Display the Summary Dialog
+my debugOutput("Preparing summary report.")
+set summaryText to "NDI Receiver Summary:" & return & return
+set summaryText to summaryText & statusSummary & return & return
+set summaryText to summaryText & "Total time: " & elapsedFormatted & return & return
+
+-- Display detailed results
+repeat with res in summaryResults
 	set summaryText to summaryText & "Receiver: " & (res's receiver) & return
-	set summaryText to summaryText & "Status: " & (res's status) & return
+	
+	-- Add a symbol to each receiver status
+	if res's status starts with "Success" then
+		set summaryText to summaryText & "Status: ✅ " & (res's status) & return
+	else if res's status starts with "Unreachable" or res's status starts with "API" then
+		set summaryText to summaryText & "Status: ❌ " & (res's status) & return
+	else
+		set summaryText to summaryText & "Status: ⚠️ " & (res's status) & return
+	end if
+	
 	set summaryText to summaryText & "Source set: " & (res's source) & return & return
 end repeat
 
+-- Display the dialog with the appropriate icon
 my debugOutput("Displaying summary dialog")
-display dialog summaryText buttons {"OK"} default button "OK" with title "NDI Receiver Setup Results"
+display dialog summaryText buttons {"OK"} default button "OK" with title "NDI Receiver Setup Results" with icon dialogIcon
+
 
 -----------------------------------------------------
 -- Utility Functions
@@ -700,6 +656,106 @@ on loginToReceiver(receiverIP, userName, userPW, connectTimeout)
 		return "{\"status\": -1, \"error\": \"Failed to extract cookie: " & cookieErr & "\"}"
 	end try
 end loginToReceiver
+
+
+-- Process a single receiver and return the result
+on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
+	my debugOutput("Starting to process receiver: " & receiverIP)
+	
+	-- Initialize a result record
+	set receiverResult to {receiver:receiverIP, status:"", source:""}
+	
+	-- Reset session cookie for each new receiver
+	set sessionCookie to ""
+	
+	try
+		-- (A) Check if receiver is available (both network and API)
+		my debugOutput("STEP A: Checking receiver availability for " & receiverIP)
+		set availabilityStatus to checkReceiverAvailability(receiverIP, jqPath)
+		
+		if not availabilityStatus's reachable then
+			set receiverResult's status to "Unreachable (network ping failed)"
+			set receiverResult's source to "N/A"
+			my debugOutput("Network unreachable for " & receiverIP & ": " & availabilityStatus's message)
+			error "Skipping receiver " & receiverIP & " - network unreachable"
+		else if not availabilityStatus's apiAvailable then
+			set receiverResult's status to "API unavailable"
+			set receiverResult's source to "N/A"
+			my debugOutput("API unavailable for " & receiverIP & ": " & availabilityStatus's message)
+			error "Skipping receiver " & receiverIP & " - API unavailable"
+		end if
+		
+		-- (B) Login to the receiver using the new session cookie management
+		my debugOutput("STEP B: Logging in to " & receiverIP)
+		set loginResponse to loginToReceiver(receiverIP, userName, userPW, connectTimeout)
+		my debugOutput("Login Response for " & receiverIP & ": " & loginResponse)
+		my checkResponse(loginResponse, "Login failed for receiver " & receiverIP, jqPath)
+		
+		-- (C) Retrieve the list of available sources using session cookie
+		my debugOutput("STEP C: Retrieving sources from " & receiverIP)
+		set getSourcesURL to "http://" & receiverIP & "/mwapi?method=get-ndi-sources"
+		set jsonResponse to runCURLWithSession(getSourcesURL, connectTimeout)
+		my debugOutput("JSON Response for " & receiverIP & ": " & jsonResponse)
+		my checkResponse(jsonResponse, "Failed to retrieve sources for receiver " & receiverIP, jqPath)
+		
+		-- (D) Find matching source for this receiver
+		my debugOutput("STEP D: Finding matching source for " & receiverIP)
+		set sourceResult to findMatchingSource(jsonResponse, receiverIP, jqPath)
+		
+		if sourceResult's found then
+			-- (E) Set the receiver's channel to the found source
+			my debugOutput("STEP E: Setting channel for " & receiverIP)
+			set setChannelURL to "http://" & receiverIP & "/mwapi?method=set-channel&ndi-name=true&name=" & sourceResult's encodedName
+			set setChannelResponse to runCURLWithSession(setChannelURL, connectTimeout)
+			my debugOutput("Set Channel Response for " & receiverIP & ": " & setChannelResponse)
+			my checkResponse(setChannelResponse, "Set channel for receiver " & receiverIP, jqPath)
+			
+			set receiverResult's status to "Success"
+			set receiverResult's source to sourceResult's sourceName
+		else
+			set receiverResult's status to "Fail (No valid source found)"
+			set receiverResult's source to "N/A"
+		end if
+		
+		-- (F) Logout from the receiver
+		my debugOutput("STEP F: Logging out from " & receiverIP)
+		set logoutURL to "http://" & receiverIP & "/mwapi?method=logout"
+		runCURLWithSession(logoutURL, connectTimeout)
+		
+	on error errMsg
+		my debugOutput("ERROR processing receiver " & receiverIP & ": " & errMsg)
+	end try
+	
+	my debugOutput("Finished processing receiver: " & receiverIP)
+	return receiverResult
+end processReceiver
+
+
+-- Find a matching NDI source for the given receiver
+on findMatchingSource(jsonResponse, receiverIP, jqPath)
+	-- Create the result record with default values
+	set sourceResult to {found:false, sourceName:"", encodedName:""}
+	
+	-- Use jq to filter sources for the desired receiver IP
+	set jqQuery to ".sources[] | select(.\"ndi-name\" | contains(\"" & receiverIP & "\"))"
+	set targetSourceRaw to do shell script "echo " & quoted form of jsonResponse & " | " & jqPath & " '" & jqQuery & "'"
+	my debugOutput("jq target source for " & receiverIP & ": " & targetSourceRaw)
+	
+	if targetSourceRaw is not "" then
+		-- Extract the ndi-name field using jq and remove extra quotes
+		set ndiNameRaw to do shell script "echo " & quoted form of targetSourceRaw & " | " & jqPath & " '.\"ndi-name\"' | tr -d '\"'"
+		my debugOutput("NDI Name for " & receiverIP & ": " & ndiNameRaw)
+		set encodedNdiName to urlEncode(ndiNameRaw)
+		my debugOutput("Encoded NDI Name for " & receiverIP & ": " & encodedNdiName)
+		
+		-- Set result values
+		set sourceResult's found to true
+		set sourceResult's sourceName to ndiNameRaw
+		set sourceResult's encodedName to encodedNdiName
+	end if
+	
+	return sourceResult
+end findMatchingSource
 
 
 -- Run curl command with session cookie
