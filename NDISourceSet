@@ -135,6 +135,7 @@ if progressDialog is not missing value then
 	close progressDialog
 end if
 
+
 -----------------------------------------------------
 -- Build and Display the Summary Dialog
 -----------------------------------------------------
@@ -147,9 +148,11 @@ end repeat
 
 display dialog summaryText buttons {"OK"} default button "OK"
 
+
 -----------------------------------------------------
 -- Utility Functions
 -----------------------------------------------------
+
 -- Find jq executable path
 on findJQPath()
 	set possiblePaths to {"/usr/local/bin/jq", "/usr/bin/jq", "/opt/homebrew/bin/jq", "~/bin/jq"}
@@ -362,6 +365,7 @@ on loadConfiguration()
 	end try
 end loadConfiguration
 
+
 -- Login to receiver and capture session cookie
 on loginToReceiver(receiverIP)
 	set loginURL to "http://" & receiverIP & "/mwapi?method=login&id=" & userName & "&pass=" & userPW
@@ -376,6 +380,7 @@ on loginToReceiver(receiverIP)
 	return do shell script "curl --connect-timeout " & connectTimeout & " --silent " & quoted form of loginURL
 end loginToReceiver
 
+
 -- Run curl command with session cookie
 on runCURLWithSession(theURL, connectTimeout)
 	if sessionCookie is "" then
@@ -387,6 +392,7 @@ on runCURLWithSession(theURL, connectTimeout)
 	end if
 end runCURLWithSession
 
+
 -- URL Encode function
 on urlEncode(input)
 	try
@@ -396,6 +402,7 @@ on urlEncode(input)
 		error "URL Encoding failed: " & errMsg
 	end try
 end urlEncode
+
 
 -- Check API response
 on checkResponse(response, errorMessage)
@@ -408,6 +415,7 @@ on checkResponse(response, errorMessage)
 		error errorMessage & " (jq parse error: " & errMsg & "). Full Response: " & response
 	end try
 end checkResponse
+
 
 -- Log message with timestamp
 on logMessage(msg)
