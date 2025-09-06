@@ -10,7 +10,7 @@
 -----------------------------------------------------
 property sessionCookie : ""
 property configFileName : "NDIReceiverConfig.json"
-property debugMode : false -- Enable debug mode
+property debugMode : true -- Enable debug mode
 
 
 -----------------------------------------------------
@@ -40,12 +40,10 @@ debugOutput("Found jq installation at: " & jqPath)
 
 
 -- Load configuration from file
-debugOutput("Loading NDI Receiver configuration JSON file.")
 set config to loadConfiguration(jqPath)
 if not config's success then
 	return -- Exit if config can't be loaded
 end if
-debugOutput("Configuration file loaded successfully.")
 
 
 -- Extract configuration values
@@ -239,21 +237,51 @@ end findJQPath
 
 -- Load configuration from file with flexible location detection
 on loadConfiguration(jqPath)
-	my debugOutput("Starting configuration loading")
+	debugOutput("Loading NDI Receiver configuration JSON file.")
 	set configResult to {success:false, userName:"", userPW:"", receiverList:{}, connectTimeout:4}
 	set configPath to missing value
 	
-	-- First, try to determine if we're running in QLab
+	-- Determine if QLab is running, and if a workspace is open
+	my debugOutput("Checking if QLab is running.")
 	set runningInQLab to false
+	
 	try
-		tell application "QLab" to get q number
-		set runningInQLab to true
-		my debugOutput("Detected running in QLab")
-	on error
-		-- Not running in QLab or QLab isn't open
+		-- Check for QLab in a more resilient way
+		set checkCmd to "ps -A | grep -v grep | grep -c \"QLab$\" || echo 0"
+		set appCountStr to do shell script checkCmd
+		
+		-- Convert to number safely
+		set appCount to 0
+		try
+			set appCount to appCountStr as number
+		on error
+			set appCount to 0
+		end try
+		
+		if appCount > 0 then
+			my debugOutput("QLab is running (detected " & appCount & " instance(s)).")
+			-- Now it's safe to communicate with QLab
+			try
+				tell application "QLab"
+					if exists front workspace then
+						set runningInQLab to true
+						my debugOutput("QLab has an open workspace. Looking for config file there.")
+					else
+						my debugOutput("QLab is running but no workspace is open.")
+					end if
+				end tell
+			on error qlabErr
+				my debugOutput("Error checking QLab workspace: " & qlabErr)
+			end try
+		else
+			my debugOutput("QLab is not running. Will not check for QLab workspace.")
+		end if
+	on error checkErr
+		my debugOutput("Error in process check: " & checkErr)
 		set runningInQLab to false
-		my debugOutput("Not running in QLab")
 	end try
+	
+	my debugOutput("Running in QLab context: " & runningInQLab)
 	
 	-- Try to find config based on context (QLab or standalone)
 	if runningInQLab then
@@ -303,22 +331,61 @@ on loadConfiguration(jqPath)
 		try
 			set scriptPath to path to me
 			my debugOutput("Script path: " & scriptPath)
-			set scriptFolder to container of scriptPath as text
-			set defaultConfigPath to scriptFolder & configFileName
-			my debugOutput("Looking for config at: " & defaultConfigPath)
 			
-			set fileExists to false
-			tell application "System Events"
-				if exists file defaultConfigPath then
-					set fileExists to true
+			-- Get the container in a more robust way
+			set scriptFolder to ""
+			try
+				-- Extract the path up to the last colon
+				set scriptPathText to scriptPath as text
+				set lastColonOffset to offset of ":" in (reverse of characters of scriptPathText) as text
+				if lastColonOffset > 0 then
+					set scriptFolder to text 1 thru -((lastColonOffset) + 1) of scriptPathText
+					my debugOutput("Script folder: " & scriptFolder)
+				else
+					-- Fallback method
+					tell application "System Events"
+						set scriptFolder to POSIX path of (container of scriptPath as alias)
+						set scriptFolder to "Macintosh HD:" & text 2 thru end of scriptFolder
+						my debugOutput("Script folder (fallback method): " & scriptFolder)
+					end tell
 				end if
-			end tell
+			on error containerErr
+				my debugOutput("Error getting script container: " & containerErr)
+				-- Second fallback - use dirname
+				try
+					set scriptPathPOSIX to POSIX path of scriptPath
+					set scriptFolder to do shell script "dirname " & quoted form of scriptPathPOSIX
+					set scriptFolder to "Macintosh HD" & scriptFolder
+					my debugOutput("Script folder (dirname method): " & scriptFolder)
+				on error dirnameErr
+					my debugOutput("Error getting script folder with dirname: " & dirnameErr)
+					set scriptFolder to ""
+				end try
+			end try
 			
-			if fileExists then
-				set configPath to defaultConfigPath
-				my debugOutput("Found config file in script folder: " & configPath)
+			if scriptFolder is not "" then
+				set defaultConfigPath to scriptFolder & ":" & configFileName
+				my debugOutput("Looking for config at: " & defaultConfigPath)
+				
+				set fileExists to false
+				try
+					tell application "System Events"
+						if exists file defaultConfigPath then
+							set fileExists to true
+						end if
+					end tell
+					
+					if fileExists then
+						set configPath to defaultConfigPath
+						my debugOutput("Found config file in script folder: " & configPath)
+					else
+						my debugOutput("Config file not found in script folder")
+					end if
+				on error existsErr
+					my debugOutput("Error checking if file exists: " & existsErr)
+				end try
 			else
-				my debugOutput("Config file not found in script folder")
+				my debugOutput("Could not determine script folder")
 			end if
 		on error scriptErr
 			my debugOutput("Error checking script location: " & scriptErr)
@@ -367,12 +434,12 @@ on loadConfiguration(jqPath)
 		set configFile to open for access configPath
 		set configData to read configFile
 		close access configFile
-		my debugOutput("Successfully read config file, validating JSON structure")
+		my debugOutput("Successfully read config file, validating JSON structure.")
 		
 		-- Validate JSON structure before extracting fields
 		try
 			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " ."
-			my debugOutput("Validating JSON structure with command: " & jqCmd)
+			my debugOutput("Validating JSON structure.")
 			do shell script jqCmd
 			my debugOutput("JSON structure validation successful")
 		on error jqError
@@ -384,12 +451,12 @@ on loadConfiguration(jqPath)
 		-- Extract individual fields with error handling for each
 		try
 			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.userName'"
-			my debugOutput("Extracting userName with command: " & jqCmd)
+			my debugOutput("Extracting userName.")
 			set configResult's userName to do shell script jqCmd
 			my debugOutput("Extracted userName: " & configResult's userName)
 			
 			if configResult's userName is "" or configResult's userName is "null" then
-				my debugOutput("ERROR: userName is missing or empty")
+				my debugOutput("ERROR: userName is missing or empty.")
 				error "userName is missing or empty"
 			end if
 		on error fieldErr
@@ -400,9 +467,9 @@ on loadConfiguration(jqPath)
 		
 		try
 			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.userPW'"
-			my debugOutput("Extracting userPW with command: " & jqCmd)
+			my debugOutput("Extracting userPW.")
 			set configResult's userPW to do shell script jqCmd
-			my debugOutput("Extracted userPW: [REDACTED]") -- Don't log actual password
+			my debugOutput("Extracted userPW: " & configResult's userPW)
 			
 			if configResult's userPW is "" or configResult's userPW is "null" then
 				my debugOutput("ERROR: userPW is missing or empty")
@@ -417,7 +484,7 @@ on loadConfiguration(jqPath)
 		try
 			-- Verify receiverList exists and is an array
 			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " '.receiverList | type'"
-			my debugOutput("Checking receiverList type with command: " & jqCmd)
+			my debugOutput("Checking receiverList type.")
 			set receiverListType to do shell script jqCmd
 			my debugOutput("receiverList type: " & receiverListType)
 			
@@ -428,7 +495,7 @@ on loadConfiguration(jqPath)
 			end if
 			
 			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[]'"
-			my debugOutput("Extracting receiverList with command: " & jqCmd)
+			my debugOutput("Extracting receiverList.")
 			set configResult's receiverList to paragraphs of (do shell script jqCmd)
 			my debugOutput("Extracted " & (count of configResult's receiverList) & " receivers: " & (configResult's receiverList as text))
 			
@@ -445,28 +512,28 @@ on loadConfiguration(jqPath)
 		
 		-- First check if the connectTimeout field exists at all
 		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"connectTimeout\")'"
-		my debugOutput("Checking if connectTimeout exists with command: " & jqCmd)
+		my debugOutput("Checking if connectTimeout exists.")
 		set hasTimeout to do shell script jqCmd
 		my debugOutput("connectTimeout exists: " & hasTimeout)
 		
 		if hasTimeout is "true" then
 			-- Field exists, get its value and check its type
 			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout | type'"
-			my debugOutput("Checking connectTimeout type with command: " & jqCmd)
+			my debugOutput("Checking connectTimeout type.")
 			set timeoutType to do shell script jqCmd
 			my debugOutput("connectTimeout type: " & timeoutType)
 			
 			if timeoutType contains "number" then
 				-- It's a number, use it directly
 				set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
-				my debugOutput("Extracting connectTimeout (number) with command: " & jqCmd)
+				my debugOutput("Extracting connectTimeout (number).")
 				set timeoutValue to do shell script jqCmd
 				set configResult's connectTimeout to timeoutValue as number
 				my debugOutput("Set connectTimeout to: " & configResult's connectTimeout)
 			else if timeoutType contains "string" then
 				-- It's a string, try to convert to number
 				set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
-				my debugOutput("Extracting connectTimeout (string) with command: " & jqCmd)
+				my debugOutput("Extracting connectTimeout (string).")
 				set timeoutStr to do shell script jqCmd
 				my debugOutput("Got connectTimeout string: " & timeoutStr)
 				try
@@ -547,7 +614,7 @@ on checkReceiverAvailability(receiverIP, jqPath)
 	end if
 	
 	-- Debug timestamp before API check
-	debugOutput("Starting API ping check for " & receiverIP & "...")
+	debugOutput("Starting API ping check for " & receiverIP)
 	
 	-- Stage 2: Check API availability with strict timeout
 	try
@@ -705,7 +772,7 @@ on debugOutput(msg)
 	-- Only log if debug mode is enabled
 	if debugMode then
 		set currentDate to do shell script "date '+%Y-%m-%d %H:%M:%S.%N'"
-		set logMsg to "[" & currentDate & "] " & msg
+		set logMsg to " [" & currentDate & "] " & msg & " "
 		
 		-- Log to the console
 		log logMsg
