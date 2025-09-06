@@ -1,0 +1,416 @@
+-----------------------------------------------------
+-- NDI Receiver Management Script
+-- Author: Original script enhanced with Claude Opus
+-- Version: 2.0
+-- Purpose: Automatically configures NDI receivers to use the correct source
+-----------------------------------------------------
+
+
+-----------------------------------------------------
+-- Global Variables and Properties
+-----------------------------------------------------
+global jqPath
+global configFileName
+property sessionCookie : ""
+property progressDialog : missing value
+
+-- Configuration file name
+set configFileName to "NDIReceiverConfig.json"
+
+
+-----------------------------------------------------
+-- Startup Processing
+-----------------------------------------------------
+
+-- Find jq path at startup
+set jqPath to findJQPath()
+if jqPath is "" then
+	display dialog "Could not find jq. Please install jq and try again." & return & return & "You can install jq with Homebrew:" & return & "brew install jq" buttons {"OK"} default button "OK" with icon stop
+	return -- Exit the script
+end if
+
+-- Load configuration from external file
+if not loadConfiguration() then
+	return -- Exit if config can't be loaded
+end if
+
+
+-----------------------------------------------------
+-- Main Script
+-----------------------------------------------------
+-- Initialize progress dialog
+set totalReceivers to count of receiverList
+set progressDialog to display dialog "Processing receivers..." buttons {"Cancel"} default button "Cancel" with title "NDI Receiver Setup" with icon 1 giving up after 3600 -- 1 hour timeout
+
+-- This list will accumulate summary records for each receiver
+set summaryResults to {}
+
+-- Main Loop: Process each receiver in sequence
+repeat with receiverIP in receiverList
+	-- Update progress dialog
+	set currentIndex to (offset of receiverIP in receiverList)
+	set progressText to "Processing receiver " & currentIndex & " of " & totalReceivers & ":" & return & receiverIP
+	set message of progressDialog to progressText
+	
+	-- Check if user canceled
+	try
+		if button returned of progressDialog is "Cancel" then
+			exit repeat
+		end if
+	end try
+	
+	-- Initialize a record to store the result for this receiver
+	set receiverResult to {receiver:receiverIP, status:"", source:""}
+	
+	-- Reset session cookie for each new receiver
+	set sessionCookie to ""
+	
+	try
+		-- (A) Ping the receiver to check if it's reachable (optimized)
+		try
+			set pingResponse to do shell script "ping -c 1 -W 0.5 -t 1 " & receiverIP & " 2>&1"
+			logMessage("Ping Response for " & receiverIP & ": " & pingResponse)
+			if pingResponse does not contain "1 packets transmitted, 1 packets received" then
+				set receiverResult's status to "Unreachable (ping failed)"
+				error "Skipping receiver " & receiverIP
+			end if
+		on error pingErr
+			set receiverResult's status to "Unreachable (ping error)"
+			set receiverResult's source to "N/A"
+			logMessage("Ping error for " & receiverIP & ": " & pingErr)
+			error "Skipping receiver " & receiverIP
+		end try
+		
+		-- (B) Login to the receiver using the new session cookie management
+		set loginResponse to loginToReceiver(receiverIP)
+		logMessage("Login Response for " & receiverIP & ": " & loginResponse)
+		my checkResponse(loginResponse, "Login failed for receiver " & receiverIP)
+		
+		-- (C) Retrieve the list of available sources using session cookie
+		set getSourcesURL to "http://" & receiverIP & "/mwapi?method=get-ndi-sources"
+		set jsonResponse to runCURLWithSession(getSourcesURL, connectTimeout)
+		logMessage("JSON Response for " & receiverIP & ": " & jsonResponse)
+		my checkResponse(jsonResponse, "Failed to retrieve sources for receiver " & receiverIP)
+		
+		-- (D) Use jq to filter sources for the desired receiver IP
+		set desiredIP to receiverIP
+		set jqQuery to ".sources[] | select(.\"ndi-name\" | contains(\"" & desiredIP & "\"))"
+		set targetSourceRaw to do shell script "echo " & quoted form of jsonResponse & " | " & jqPath & " '" & jqQuery & "'"
+		logMessage("jq target source for " & receiverIP & ": " & targetSourceRaw)
+		
+		if targetSourceRaw is not "" then
+			-- (E) Extract the ndi-name field using jq and remove extra quotes
+			set ndiNameRaw to do shell script "echo " & quoted form of targetSourceRaw & " | " & jqPath & " '.\"ndi-name\"' | tr -d '\"'"
+			logMessage("NDI Name for " & receiverIP & ": " & ndiNameRaw)
+			set encodedNdiName to urlEncode(ndiNameRaw)
+			logMessage("Encoded NDI Name for " & receiverIP & ": " & encodedNdiName)
+			
+			-- (F) Set the receiver's channel to the found source
+			set setChannelURL to "http://" & receiverIP & "/mwapi?method=set-channel&ndi-name=true&name=" & encodedNdiName
+			set setChannelResponse to runCURLWithSession(setChannelURL, connectTimeout)
+			logMessage("Set Channel Response for " & receiverIP & ": " & setChannelResponse)
+			my checkResponse(setChannelResponse, "Set channel for receiver " & receiverIP)
+			
+			set receiverResult's status to "Success"
+			set receiverResult's source to ndiNameRaw
+		else
+			set receiverResult's status to "Fail (No valid source found)"
+			set receiverResult's source to "N/A"
+		end if
+		
+		-- (G) Logout from the receiver
+		set logoutURL to "http://" & receiverIP & "/mwapi?method=logout"
+		runCURLWithSession(logoutURL, connectTimeout)
+		
+	on error errMsg
+		logMessage("Error processing receiver " & receiverIP & ": " & errMsg)
+	end try
+	
+	-- Append the result for this receiver to the summaryResults list
+	set end of summaryResults to receiverResult
+end repeat
+
+-- Close progress dialog
+if progressDialog is not missing value then
+	close progressDialog
+end if
+
+-----------------------------------------------------
+-- Build and Display the Summary Dialog
+-----------------------------------------------------
+set summaryText to "Receiver Summary:" & return & return
+repeat with res in summaryResults
+	set summaryText to summaryText & "Receiver: " & (res's receiver) & return
+	set summaryText to summaryText & "Status: " & (res's status) & return
+	set summaryText to summaryText & "Source set: " & (res's source) & return & return
+end repeat
+
+display dialog summaryText buttons {"OK"} default button "OK"
+
+-----------------------------------------------------
+-- Utility Functions
+-----------------------------------------------------
+-- Find jq executable path
+on findJQPath()
+	set possiblePaths to {"/usr/local/bin/jq", "/usr/bin/jq", "/opt/homebrew/bin/jq", "~/bin/jq"}
+	
+	-- First try the which command to find it in PATH
+	try
+		set jqPathFromEnv to do shell script "which jq"
+		if jqPathFromEnv is not "" then
+			-- Found jq in PATH
+			logMessage("Found jq in PATH: " & jqPathFromEnv)
+			return jqPathFromEnv
+		end if
+	on error
+		-- which command failed, jq might not be in PATH
+	end try
+	
+	-- Check each possible location
+	repeat with testPath in possiblePaths
+		try
+			-- Expand path if it contains tilde
+			if testPath begins with "~/" then
+				set homeFolder to POSIX path of (path to home folder)
+				set testPath to homeFolder & text 3 thru -1 of testPath
+			end if
+			
+			-- Test if jq exists at this path
+			do shell script "[ -x " & quoted form of testPath & " ]"
+			logMessage("Found jq at: " & testPath)
+			return testPath
+		on error
+			-- Not found at this path, continue checking
+		end try
+	end repeat
+	
+	-- Not found in any location
+	return ""
+end findJQPath
+
+-- Load configuration from external JSON file
+on loadConfiguration()
+	set configPath to missing value
+	
+	-- First, try to determine if we're running in QLab
+	set runningInQLab to false
+	try
+		tell application "QLab" to get q number
+		set runningInQLab to true
+	on error
+		-- Not running in QLab or QLab isn't open
+		set runningInQLab to false
+	end try
+	
+	-- Try to find config based on context (QLab or standalone)
+	if runningInQLab then
+		-- In QLab: Look for config file relative to the current workspace
+		try
+			tell application "QLab"
+				if exists front workspace then
+					set showfilePath to path of front workspace
+					-- Extract directory from the full path
+					set showfileFolder to do shell script "dirname " & quoted form of showfilePath
+					set defaultConfigPath to showfileFolder & "/" & configFileName
+					
+					-- Check if config exists in the showfile's directory
+					tell application "System Events"
+						if exists file defaultConfigPath then
+							set configPath to defaultConfigPath
+							logMessage("Found config file in QLab workspace folder: " & configPath)
+						end if
+					end tell
+				end if
+			end tell
+		on error qlabErr
+			logMessage("Error checking QLab workspace location: " & qlabErr)
+		end try
+	else
+		-- Standalone: Look for config in the script's directory
+		try
+			set scriptPath to path to me
+			set scriptFolder to container of scriptPath as text
+			set defaultConfigPath to scriptFolder & configFileName
+			
+			tell application "System Events"
+				if exists file defaultConfigPath then
+					set configPath to defaultConfigPath
+					logMessage("Found config file in script folder: " & configPath)
+				end if
+			end tell
+		on error scriptErr
+			logMessage("Error checking script location: " & scriptErr)
+		end try
+	end if
+	
+	-- If still not found, try Documents folder as a fallback
+	if configPath is missing value then
+		set docsConfigPath to (path to documents folder as text) & configFileName
+		tell application "System Events"
+			if exists file docsConfigPath then
+				set configPath to docsConfigPath
+				logMessage("Found config file in Documents folder: " & configPath)
+			end if
+		end tell
+	end if
+	
+	-- If still not found, prompt user to select it
+	if configPath is missing value then
+		try
+			set userPrompt to "Configuration file (" & configFileName & ") not found." & return & return & "Please select the configuration file:"
+			set defaultLocation to path to documents folder
+			set selectedFile to choose file with prompt userPrompt default location defaultLocation
+			set configPath to selectedFile as text
+			logMessage("User selected config file: " & configPath)
+		on error
+			display dialog "No configuration file selected. Cannot continue." buttons {"OK"} default button "OK" with icon stop
+			return false
+		end try
+	end if
+	
+	-- Now validate and parse the JSON file
+	try
+		set configFile to open for access configPath
+		set configData to read configFile
+		close access configFile
+		
+		-- Validate JSON structure before extracting fields
+		try
+			do shell script "echo " & quoted form of configData & " | " & jqPath & " ."
+		on error jqError
+			display dialog "The configuration file contains invalid JSON:" & return & return & jqError buttons {"OK"} default button "OK" with icon stop
+			return false
+		end try
+		
+		-- Extract individual fields with error handling for each
+		try
+			set userName to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.userName'"
+			if userName is "" or userName is "null" then error "userName is missing or empty"
+		on error fieldErr
+			display dialog "Error in configuration file: userName field is invalid or missing." buttons {"OK"} default button "OK" with icon stop
+			return false
+		end try
+		
+		try
+			set userPW to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.userPW'"
+			if userPW is "" or userPW is "null" then error "userPW is missing or empty"
+		on error fieldErr
+			display dialog "Error in configuration file: userPW field is invalid or missing." buttons {"OK"} default button "OK" with icon stop
+			return false
+		end try
+		
+		try
+			-- Verify receiverList exists and is an array
+			do shell script "echo " & quoted form of configData & " | " & jqPath & " '.receiverList | type'"
+			set receiverListType to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList | type'"
+			
+			if receiverListType is not "array" then
+				display dialog "Error in configuration file: receiverList must be an array." buttons {"OK"} default button "OK" with icon stop
+				return false
+			end if
+			
+			set receiverList to paragraphs of (do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[]'")
+			
+			if (count of receiverList) is 0 or receiverList is {"null"} then
+				display dialog "Error in configuration file: receiverList is empty." buttons {"OK"} default button "OK" with icon stop
+				return false
+			end if
+		on error fieldErr
+			display dialog "Error in configuration file: receiverList field is invalid or missing." & return & return & fieldErr buttons {"OK"} default button "OK" with icon stop
+			return false
+		end try
+		
+		-- First check if the connectTimeout field exists at all
+		set hasTimeout to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"connectTimeout\")'"
+		
+		if hasTimeout is "true" then
+			-- Field exists, get its value and check its type
+			set timeoutType to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout | type'"
+			
+			if timeoutType is "number" then
+				-- It's a number, use it directly
+				set connectTimeout to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
+				set connectTimeout to connectTimeout as number
+			else if timeoutType is "string" then
+				-- It's a string, try to convert to number
+				set timeoutStr to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
+				try
+					set connectTimeout to timeoutStr as number
+				on error
+					display dialog "Error in configuration file: connectTimeout must be a number, got \"" & timeoutStr & "\"" buttons {"OK"} default button "OK" with icon stop
+					return false
+				end try
+			else if timeoutType is "null" then
+				-- It's explicitly null, use default
+				set connectTimeout to 4
+			else
+				-- It's some other type (boolean, object, array)
+				display dialog "Error in configuration file: connectTimeout must be a number, got " & timeoutType buttons {"OK"} default button "OK" with icon stop
+				return false
+			end if
+		else
+			-- Field doesn't exist at all, use default
+			set connectTimeout to 4
+			logMessage("connectTimeout not found in config, using default: 4")
+		end if
+		
+		logMessage("Configuration loaded successfully from: " & configPath)
+		return true
+	on error errMsg
+		display dialog "Failed to load configuration: " & errMsg buttons {"OK"} default button "OK" with icon stop
+		return false
+	end try
+end loadConfiguration
+
+-- Login to receiver and capture session cookie
+on loginToReceiver(receiverIP)
+	set loginURL to "http://" & receiverIP & "/mwapi?method=login&id=" & userName & "&pass=" & userPW
+	
+	-- Capture the cookie data from curl
+	set cookieOutput to do shell script "curl --connect-timeout " & connectTimeout & " --silent --cookie-jar - " & quoted form of loginURL
+	
+	-- Store the cookie in the global variable
+	set sessionCookie to cookieOutput
+	
+	-- Return the response from the login
+	return do shell script "curl --connect-timeout " & connectTimeout & " --silent " & quoted form of loginURL
+end loginToReceiver
+
+-- Run curl command with session cookie
+on runCURLWithSession(theURL, connectTimeout)
+	if sessionCookie is "" then
+		-- No cookie available, just run a simple curl command
+		return do shell script "curl --connect-timeout " & connectTimeout & " --silent " & quoted form of theURL
+	else
+		-- Use the stored session cookie
+		return do shell script "curl --connect-timeout " & connectTimeout & " --silent --cookie - " & quoted form of theURL & " <<< " & quoted form of sessionCookie
+	end if
+end runCURLWithSession
+
+-- URL Encode function
+on urlEncode(input)
+	try
+		set encoded to do shell script "python3 -c 'import urllib.parse; print(urllib.parse.quote(\"" & input & "\"))'"
+		return encoded
+	on error errMsg
+		error "URL Encoding failed: " & errMsg
+	end try
+end urlEncode
+
+-- Check API response
+on checkResponse(response, errorMessage)
+	try
+		set statusValue to do shell script "echo " & quoted form of response & " | " & jqPath & " '.status'"
+		if statusValue as text is not "0" then
+			error errorMessage & " failed. Response: " & response
+		end if
+	on error errMsg
+		error errorMessage & " (jq parse error: " & errMsg & "). Full Response: " & response
+	end try
+end checkResponse
+
+-- Log message with timestamp
+on logMessage(msg)
+	set currentDate to do shell script "date '+%Y-%m-%d %H:%M:%S'"
+	log "[" & currentDate & "] " & msg
+end logMessage
