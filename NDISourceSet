@@ -10,7 +10,7 @@
 -----------------------------------------------------
 property sessionCookie : ""
 property configFileName : "NDIReceiverConfig.json"
-property debugMode : false -- Enable debug mode
+property debugMode : true -- Enable debug mode
 
 
 -----------------------------------------------------
@@ -51,7 +51,9 @@ set userName to config's userName
 set userPW to config's userPW
 set receiverList to config's receiverList
 set connectTimeout to config's connectTimeout
-debugOutput("Count of receivers to process: " & (count of receiverList))
+set retryAttempts to config's retryAttempts
+my debugOutput("Count of receivers to process: " & (count of receiverList))
+my debugOutput("Retry attempts configured: " & retryAttempts)
 
 
 -- At the beginning of the script, after loading configuration, display warning to user prior to proceeding
@@ -69,20 +71,101 @@ set startTimeSeconds to do shell script "date +%s"
 set summaryResults to {}
 
 
--- Main Loop: Process each receiver in sequence
-repeat with i from 1 to count of receiverList
-	set receiverIP to item i of receiverList
-	
-	-- Update progress text
-	set progressText to "Processing receiver " & i & " of " & (count of receiverList) & ": " & receiverIP
-	my debugOutput(progressText)
-	
-	-- Process the receiver using our modular function
-	set receiverResult to processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
-	
-	-- Append the result to the summaryResults list
-	set end of summaryResults to receiverResult
+-- Main multi-pass processing loop
+set summaryResults to {}
+set remainingReceiverIPs to receiverList
+set processedReceivers to {}
+set currentPass to 1
+set maxPasses to retryAttempts + 1
+
+my debugOutput("Beginning processing with up to " & maxPasses & " passes (" & retryAttempts & " retry attempts)")
+
+-- Initialize a tracking record for each receiver
+repeat with receiverIP in receiverList
+	set theTracking to {theIP:receiverIP, theResult:missing value, passNum:0, required_retry:false}
+	set end of processedReceivers to theTracking
 end repeat
+
+-- Continue processing passes until we've either processed all receivers successfully,
+-- or we've reached the maximum number of retry attempts
+repeat while ((count of remainingReceiverIPs) > 0) and (currentPass ≤ maxPasses)
+	my debugOutput("Starting pass " & currentPass & " with " & (count of remainingReceiverIPs) & " receivers")
+	
+	-- Display progress info for this pass
+	if currentPass > 1 then
+		set passDisplay to "Retry pass " & (currentPass - 1) & " of " & retryAttempts
+	else
+		set passDisplay to "Initial processing"
+	end if
+	
+	-- Process receivers in this pass
+	set stillFailedReceivers to {}
+	
+	repeat with i from 1 to count of remainingReceiverIPs
+		set receiverIP to item i of remainingReceiverIPs
+		
+		-- Update progress text
+		set progressText to passDisplay & ": Processing receiver " & i & " of " & (count of remainingReceiverIPs) & ": " & receiverIP
+		my debugOutput(progressText)
+		
+		-- Process the receiver using our modular function
+		set receiverResult to processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
+		
+		-- Update our tracking for this receiver
+		repeat with j from 1 to count of processedReceivers
+			set currentTracking to item j of processedReceivers
+			
+			if theIP of currentTracking is receiverIP then
+				set theResult of item j of processedReceivers to receiverResult
+				set passNum of item j of processedReceivers to currentPass
+				
+				if currentPass > 1 then
+					set required_retry of item j of processedReceivers to true
+				end if
+				
+				exit repeat
+			end if
+		end repeat
+		
+		-- Check if we need to retry this receiver in the next pass
+		if receiverResult's status starts with "Success" then
+			-- Success! No need to add to stillFailedReceivers
+		else
+			-- Failed - add to still failed list for next pass if we have more passes left
+			if currentPass < maxPasses then
+				set end of stillFailedReceivers to receiverIP
+			end if
+		end if
+	end repeat
+	
+	-- Update for next pass
+	set remainingReceiverIPs to stillFailedReceivers
+	set currentPass to currentPass + 1
+	
+	-- If we need another pass, add a small delay to give devices time to recover
+	if (count of remainingReceiverIPs) > 0 and currentPass ≤ maxPasses then
+		my debugOutput("Waiting 2 seconds before retry pass " & (currentPass - 1) & "...")
+		delay 2 -- Wait 2 seconds between passes
+	end if
+end repeat
+
+-- Build the final results list from our tracking
+repeat with receiverTracking in processedReceivers
+	set end of summaryResults to theResult of receiverTracking
+end repeat
+
+-- Calculate how many passes we actually did
+set passesCompleted to currentPass - 1
+if passesCompleted > 1 then
+	if passesCompleted > 2 then
+		set retryInfo to "Completed " & passesCompleted & " passes (original + " & (passesCompleted - 1) & " retry passes)"
+	else
+		set retryInfo to "Completed " & passesCompleted & " passes (original + " & (passesCompleted - 1) & " retry pass)"
+	end if
+else
+	set retryInfo to "Completed in a single pass (no retries needed)"
+end if
+my debugOutput(retryInfo)
 
 
 -- Calculate elapsed time
@@ -96,12 +179,21 @@ set totalReceivers to count of summaryResults
 set successCount to 0
 set failCount to 0
 
-repeat with res in summaryResults
-	if res's status starts with "Success" then
-		set successCount to successCount + 1
-	else
+repeat with i from 1 to count of summaryResults
+	set currentResult to item i of summaryResults
+	try
+		set currentStatus to status of currentResult
+		
+		if currentStatus starts with "Success" then
+			set successCount to successCount + 1
+		else
+			set failCount to failCount + 1
+		end if
+	on error
+		-- If we can't access the status, count it as a failure
 		set failCount to failCount + 1
-	end if
+		my debugOutput("Error accessing status for result " & i)
+	end try
 end repeat
 
 -- Determine the appropriate icon based on success/failure ratio
@@ -123,25 +215,53 @@ else
 end if
 
 -- Build and Display the Summary Dialog
-my debugOutput("Preparing summary report.")
 set summaryText to "NDI Receiver Summary:" & return & return
 set summaryText to summaryText & statusSummary & return & return
+set summaryText to summaryText & retryInfo & return & return
 set summaryText to summaryText & "Total time: " & elapsedFormatted & return & return
 
 -- Display detailed results
-repeat with res in summaryResults
-	set summaryText to summaryText & "Receiver: " & (res's receiver) & return
+repeat with i from 1 to count of summaryResults
+	set currentResult to item i of summaryResults
 	
-	-- Add a symbol to each receiver status
-	if res's status starts with "Success" then
-		set summaryText to summaryText & "Status: ✅ " & (res's status) & return
-	else if res's status starts with "Unreachable" or res's status starts with "API" then
-		set summaryText to summaryText & "Status: ❌ " & (res's status) & return
-	else
-		set summaryText to summaryText & "Status: ⚠️ " & (res's status) & return
-	end if
-	
-	set summaryText to summaryText & "Source set: " & (res's source) & return & return
+	try
+		set currentReceiver to receiver of currentResult
+		set currentStatus to status of currentResult
+		set currentSource to source of currentResult
+		
+		set summaryText to summaryText & "Receiver: " & currentReceiver & return
+		
+		-- Find if this receiver required a retry
+		set requiredRetry to false
+		repeat with j from 1 to count of processedReceivers
+			set receiverTracking to item j of processedReceivers
+			if theIP of receiverTracking is currentReceiver and required_retry of receiverTracking then
+				set requiredRetry to true
+				exit repeat
+			end if
+		end repeat
+		
+		-- Add a symbol to each receiver status
+		if currentStatus starts with "Success" then
+			if requiredRetry then
+				-- Success after retry - show caution symbol
+				set summaryText to summaryText & "Status: ⚠️ " & currentStatus & " (after retry)" & return
+			else
+				-- Success on first try
+				set summaryText to summaryText & "Status: ✅ " & currentStatus & return
+			end if
+		else if currentStatus starts with "Unreachable" or currentStatus starts with "API" then
+			set summaryText to summaryText & "Status: ❌ " & currentStatus & return
+		else
+			set summaryText to summaryText & "Status: ⚠️ " & currentStatus & return
+		end if
+		
+		set summaryText to summaryText & "Source set: " & currentSource & return & return
+	on error errMsg
+		-- Handle errors in accessing result properties
+		set summaryText to summaryText & "Receiver #" & i & ": [Error displaying result]" & return & return
+		my debugOutput("Error in summary for result " & i & ": " & errMsg)
+	end try
 end repeat
 
 -- Display the dialog with the appropriate icon
@@ -194,7 +314,7 @@ end findJQPath
 -- Load configuration from file with flexible location detection
 on loadConfiguration(jqPath)
 	debugOutput("Loading NDI Receiver configuration JSON file.")
-	set configResult to {success:false, userName:"", userPW:"", receiverList:{}, connectTimeout:4}
+	set configResult to {success:false, userName:"", userPW:"", receiverList:{}, connectTimeout:4, retryAttempts:2}
 	set configPath to missing value
 	
 	-- Determine if QLab is running, and if a workspace is open
@@ -515,6 +635,30 @@ on loadConfiguration(jqPath)
 			set configResult's connectTimeout to 4
 			my debugOutput("connectTimeout not found in config, using default: 4")
 		end if
+		
+		-- Check for retryAttempts in config
+		set configResult's retryAttempts to 2 -- Default value
+		try
+			set hasRetryAttempts to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"retryAttempts\")'"
+			my debugOutput("Checking if retryAttempts exists: " & hasRetryAttempts)
+			
+			if hasRetryAttempts is "true" then
+				set retryType to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryAttempts | type'"
+				my debugOutput("retryAttempts type: " & retryType)
+				
+				if retryType contains "number" then
+					set retryValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryAttempts'"
+					set configResult's retryAttempts to retryValue as number
+					my debugOutput("Using retryAttempts from config: " & configResult's retryAttempts)
+				else
+					my debugOutput("retryAttempts is not a number, using default: " & configResult's retryAttempts)
+				end if
+			else
+				my debugOutput("retryAttempts not found in config, using default: " & configResult's retryAttempts)
+			end if
+		on error retryErr
+			my debugOutput("Error parsing retryAttempts: " & retryErr & ", using default: " & configResult's retryAttempts)
+		end try
 		
 		set configResult's success to true
 		my debugOutput("Configuration loaded successfully from: " & configPath)
