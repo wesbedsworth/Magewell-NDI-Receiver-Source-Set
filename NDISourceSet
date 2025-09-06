@@ -1,9 +1,11 @@
 -----------------------------------------------------
 -- NDI Receiver Management Script
 -- Version: 2.1 Debug
--- Purpose: Automatically configures NDI receivers to use the correct source
+-- Purpose: Automatically configures NDI receivers to use the correct source based on IP address
 -----------------------------------------------------
 
+
+-----------------------------------------------------
 -- Script Properties
 -----------------------------------------------------
 property sessionCookie : ""
@@ -14,31 +16,36 @@ property debugMode : true -- Enable debug mode
 -----------------------------------------------------
 -- Main Script
 -----------------------------------------------------
--- Start debugging output
+-- Start debugging output if debugMod is enabled
 if debugMode then
-	display dialog "Debug mode enabled. Press OK to start execution." buttons {"OK"} default button "OK"
+	set debugResponse to display dialog "Debug mode enabled. Press OK to start execution or Cancel to abort." buttons {"Cancel", "OK"} default button "OK" with icon caution
+	
+	if button returned of debugResponse is "Cancel" then
+		-- User canceled execution
+		return -- Exit the script
+	end if
+	
+	debugOutput("NDI Receiver Management Script starting...")
 end if
-
-debugOutput("Script starting")
 
 
 -- Find jq path dynamically
-debugOutput("Finding jq path...")
+debugOutput("Determining path to jq and verifying installation.")
 set jqPath to findJQPath()
 if jqPath is "" then
 	display dialog "Could not find jq. Please install jq and try again." & return & return & "You can install jq with Homebrew:" & return & "brew install jq" buttons {"OK"} default button "OK" with icon stop
 	return -- Exit the script
 end if
-debugOutput("Found jq at: " & jqPath)
+debugOutput("Found jq installation at: " & jqPath)
 
 
 -- Load configuration from file
-debugOutput("Loading configuration...")
+debugOutput("Loading NDI Receiver configuration JSON file.")
 set config to loadConfiguration(jqPath)
 if not config's success then
 	return -- Exit if config can't be loaded
 end if
-debugOutput("Configuration loaded successfully")
+debugOutput("Configuration file loaded successfully.")
 
 
 -- Extract configuration values
@@ -46,11 +53,11 @@ set userName to config's userName
 set userPW to config's userPW
 set receiverList to config's receiverList
 set connectTimeout to config's connectTimeout
-debugOutput("Receiver count: " & (count of receiverList))
+debugOutput("Count of receivers to process: " & (count of receiverList))
 
 
--- At the beginning of the script, after loading configuration:
-display dialog "About to process " & (count of receiverList) & " receivers." & return & return & "This will take a few moments. A summary will be displayed when complete." buttons {"OK", "Cancel"} default button "OK"
+-- At the beginning of the script, after loading configuration, display warning to user prior to proceeding
+display dialog "About to set channels for " & (count of receiverList) & " NDI receivers." & return & return & "This will take a few moments during which there will be no progress indication on the screen." & return & return & "Please be patient. A summary will be displayed when complete." buttons {"OK", "Cancel"} default button "OK"
 if button returned of result is "Cancel" then
 	return -- Exit if user cancels
 end if
@@ -85,13 +92,13 @@ repeat with i from 1 to count of receiverList
 		-- Debug marker AFTER availability check
 		set endTime to current date
 		set elapsedSeconds to endTime - startTime
-		debugOutput("Availability check completed in " & elapsedSeconds & " seconds")
+		debugOutput("Availability check completed in " & elapsedSeconds & " seconds.")
 		debugOutput("Availability result: reachable=" & availabilityStatus's reachable & ", apiAvailable=" & availabilityStatus's apiAvailable)
 		
 		if not availabilityStatus's reachable then
 			set receiverResult's status to "Unreachable (network ping failed)"
 			set receiverResult's source to "N/A"
-			debugOutput("Network unreachable for " & receiverIP & ": " & availabilityStatus's message)
+			debugOutput("Device unreachable at " & receiverIP & ": " & availabilityStatus's message)
 			error "Skipping receiver " & receiverIP & " - network unreachable"
 		else if not availabilityStatus's apiAvailable then
 			set receiverResult's status to "API unavailable"
@@ -101,9 +108,9 @@ repeat with i from 1 to count of receiverList
 		end if
 		
 		-- Debug marker BEFORE login
-		debugOutput("STEP B: Logging in to " & receiverIP)
+		debugOutput("STEP B: Logging in to " & receiverIP & " and retrieving session cookie.")
 		
-		-- (B) Login to the receiver using the new session cookie management
+		-- (B) Login to the receiver using session cookie management
 		set loginResponse to loginToReceiver(receiverIP, userName, userPW, connectTimeout)
 		debugOutput("Login Response for " & receiverIP & ": " & loginResponse)
 		checkResponse(loginResponse, "Login failed for receiver " & receiverIP, jqPath)
@@ -114,7 +121,7 @@ repeat with i from 1 to count of receiverList
 		-- (C) Retrieve the list of available sources using session cookie
 		set getSourcesURL to "http://" & receiverIP & "/mwapi?method=get-ndi-sources"
 		set jsonResponse to runCURLWithSession(getSourcesURL, connectTimeout)
-		debugOutput("JSON Response for " & receiverIP & ": " & jsonResponse)
+		debugOutput("NDI Sources JSON response for " & receiverIP & ": " & jsonResponse)
 		checkResponse(jsonResponse, "Failed to retrieve sources for receiver " & receiverIP, jqPath)
 		
 		-- Debug marker BEFORE source filtering
@@ -124,13 +131,13 @@ repeat with i from 1 to count of receiverList
 		set desiredIP to receiverIP
 		set jqQuery to ".sources[] | select(.\"ndi-name\" | contains(\"" & desiredIP & "\"))"
 		set targetSourceRaw to do shell script "echo " & quoted form of jsonResponse & " | " & jqPath & " '" & jqQuery & "'"
-		debugOutput("jq target source for " & receiverIP & ": " & targetSourceRaw)
+		debugOutput("Target source for " & receiverIP & " obtained via jq: " & targetSourceRaw)
 		
 		if targetSourceRaw is not "" then
 			-- Debug marker BEFORE source extraction
 			debugOutput("STEP E: Extracting NDI name for " & receiverIP)
 			
-			-- (E) Extract the ndi-name field using jq and remove extra quotes
+			-- (E) Extract the ndi-name field using jq and remove extra quotes, then URL encode the name
 			set ndiNameRaw to do shell script "echo " & quoted form of targetSourceRaw & " | " & jqPath & " '.\"ndi-name\"' | tr -d '\"'"
 			debugOutput("NDI Name for " & receiverIP & ": " & ndiNameRaw)
 			set encodedNdiName to urlEncode(ndiNameRaw)
@@ -175,15 +182,14 @@ set elapsedSeconds to (endTimeSeconds as number) - (startTimeSeconds as number)
 set elapsedFormatted to my formatSeconds(elapsedSeconds)
 
 -- Build and Display the Summary Dialog with timing information
+set summaryText to summaryText & "Total time elapsed: " & elapsedFormatted & return & return
 set summaryText to "Receiver Summary:" & return & return
-set summaryText to summaryText & "Total time: " & elapsedFormatted & return & return
 repeat with res in summaryResults
 	set summaryText to summaryText & "Receiver: " & (res's receiver) & return
 	set summaryText to summaryText & "Status: " & (res's status) & return
 	set summaryText to summaryText & "Source set: " & (res's source) & return & return
 end repeat
-
-display dialog summaryText buttons {"OK"} default button "OK"
+display dialog summaryText buttons {"OK"} default button "OK" with title "NDI Receiver Setup Results"
 
 
 -----------------------------------------------------
@@ -216,7 +222,7 @@ on findJQPath()
 			
 			-- Test if jq exists at this path
 			do shell script "[ -x " & quoted form of testPath & " ]"
-			debugOutput("Found jq at: " & testPath)
+			debugOutput("Found jq installation at: " & testPath)
 			return testPath
 		on error
 			-- Not found at this path, continue checking
@@ -413,7 +419,7 @@ on checkReceiverAvailability(receiverIP, jqPath)
 	set errorMessage to ""
 	
 	-- Debug timestamp before network check
-	debugOutput("Starting network ping check for " & receiverIP & "...")
+	debugOutput("Starting network ping check for " & receiverIP)
 	
 	-- Stage 1: Check basic network connectivity with strict timeout
 	try
@@ -523,7 +529,7 @@ on loginToReceiver(receiverIP, userName, userPW, connectTimeout)
 			return "{\"status\": 0}"
 		else
 			set sessionCookie to ""
-			debugOutput("No session ID found in response")
+			debugOutput("No session ID found in response.")
 			-- Return error if no session ID found
 			return "{\"status\": -1, \"error\": \"No session ID in response\"}"
 		end if
@@ -592,9 +598,12 @@ end formatSeconds
 
 -- Enhanced debug output function
 on debugOutput(msg)
-	set currentDate to do shell script "date '+%Y-%m-%d %H:%M:%S.%N'"
-	set logMsg to "[" & currentDate & "] " & msg
-	
-	-- Log to the console
-	log logMsg
+	-- Only log if debug mode is enabled
+	if debugMode then
+		set currentDate to do shell script "date '+%Y-%m-%d %H:%M:%S.%N'"
+		set logMsg to "[" & currentDate & "] " & msg
+		
+		-- Log to the console
+		log logMsg
+	end if
 end debugOutput
