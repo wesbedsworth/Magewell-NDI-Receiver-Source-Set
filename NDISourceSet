@@ -71,6 +71,8 @@ set startTimeSeconds to do shell script "date +%s"
 set summaryResults to {}
 
 
+-- Replace the entire multi-pass processing loop with this version:
+
 -- Main multi-pass processing loop
 set summaryResults to {}
 set remainingReceiverIPs to receiverList
@@ -82,7 +84,9 @@ my debugOutput("Beginning processing with up to " & maxPasses & " passes (" & re
 
 -- Initialize a tracking record for each receiver
 repeat with receiverIP in receiverList
-	set theTracking to {theIP:receiverIP, theResult:missing value, passNum:0, required_retry:false}
+	-- Create a dummy result record that will be updated
+	set dummyResult to {receiver:receiverIP, status:"Not processed", source:"N/A"}
+	set theTracking to {theIP:receiverIP, theResult:dummyResult, passNum:0, required_retry:false}
 	set end of processedReceivers to theTracking
 end repeat
 
@@ -116,11 +120,14 @@ repeat while ((count of remainingReceiverIPs) > 0) and (currentPass ≤ maxPasse
 			set currentTracking to item j of processedReceivers
 			
 			if theIP of currentTracking is receiverIP then
+				-- Update the result
 				set theResult of item j of processedReceivers to receiverResult
 				set passNum of item j of processedReceivers to currentPass
 				
+				-- Mark as requiring retry if this isn't the first pass
 				if currentPass > 1 then
 					set required_retry of item j of processedReceivers to true
+					my debugOutput("Marked receiver " & receiverIP & " as requiring retry")
 				end if
 				
 				exit repeat
@@ -128,12 +135,16 @@ repeat while ((count of remainingReceiverIPs) > 0) and (currentPass ≤ maxPasse
 		end repeat
 		
 		-- Check if we need to retry this receiver in the next pass
-		if receiverResult's status starts with "Success" then
+		if (status of receiverResult) starts with "Success" then
 			-- Success! No need to add to stillFailedReceivers
+			my debugOutput("Receiver " & receiverIP & " succeeded, no retry needed")
 		else
 			-- Failed - add to still failed list for next pass if we have more passes left
 			if currentPass < maxPasses then
+				my debugOutput("Receiver " & receiverIP & " failed, will retry in next pass")
 				set end of stillFailedReceivers to receiverIP
+			else
+				my debugOutput("Receiver " & receiverIP & " failed in final pass, no more retries")
 			end if
 		end if
 	end repeat
@@ -150,8 +161,15 @@ repeat while ((count of remainingReceiverIPs) > 0) and (currentPass ≤ maxPasse
 end repeat
 
 -- Build the final results list from our tracking
+my debugOutput("Building final results from tracking data")
 repeat with receiverTracking in processedReceivers
-	set end of summaryResults to theResult of receiverTracking
+	set currentResult to theResult of receiverTracking
+	if currentResult is not missing value then
+		set end of summaryResults to currentResult
+		my debugOutput("Added result for " & (receiver of currentResult) & " with status: " & (status of currentResult))
+	else
+		my debugOutput("Warning: Missing result in processed receivers")
+	end if
 end repeat
 
 -- Calculate how many passes we actually did
@@ -174,27 +192,27 @@ set elapsedSeconds to (endTimeSeconds as number) - (startTimeSeconds as number)
 set elapsedFormatted to my formatSeconds(elapsedSeconds)
 
 
+-- Replace the summary analysis and display section with this version:
+
 -- Analyze the overall status
+my debugOutput("Analyzing results for " & (count of summaryResults) & " receivers")
 set totalReceivers to count of summaryResults
 set successCount to 0
 set failCount to 0
 
 repeat with i from 1 to count of summaryResults
 	set currentResult to item i of summaryResults
-	try
-		set currentStatus to status of currentResult
-		
-		if currentStatus starts with "Success" then
-			set successCount to successCount + 1
-		else
-			set failCount to failCount + 1
-		end if
-	on error
-		-- If we can't access the status, count it as a failure
+	set currentStatus to status of currentResult
+	
+	my debugOutput("Analyzing result " & i & " with status: " & currentStatus)
+	if currentStatus starts with "Success" then
+		set successCount to successCount + 1
+	else
 		set failCount to failCount + 1
-		my debugOutput("Error accessing status for result " & i)
-	end try
+	end if
 end repeat
+
+my debugOutput("Analysis complete: " & successCount & " succeeded, " & failCount & " failed")
 
 -- Determine the appropriate icon based on success/failure ratio
 set dialogIcon to missing value
@@ -223,45 +241,38 @@ set summaryText to summaryText & "Total time: " & elapsedFormatted & return & re
 -- Display detailed results
 repeat with i from 1 to count of summaryResults
 	set currentResult to item i of summaryResults
+	set currentReceiver to receiver of currentResult
+	set currentStatus to status of currentResult
+	set currentSource to source of currentResult
 	
-	try
-		set currentReceiver to receiver of currentResult
-		set currentStatus to status of currentResult
-		set currentSource to source of currentResult
-		
-		set summaryText to summaryText & "Receiver: " & currentReceiver & return
-		
-		-- Find if this receiver required a retry
-		set requiredRetry to false
-		repeat with j from 1 to count of processedReceivers
-			set receiverTracking to item j of processedReceivers
-			if theIP of receiverTracking is currentReceiver and required_retry of receiverTracking then
-				set requiredRetry to true
-				exit repeat
-			end if
-		end repeat
-		
-		-- Add a symbol to each receiver status
-		if currentStatus starts with "Success" then
-			if requiredRetry then
-				-- Success after retry - show caution symbol
-				set summaryText to summaryText & "Status: ⚠️ " & currentStatus & " (after retry)" & return
-			else
-				-- Success on first try
-				set summaryText to summaryText & "Status: ✅ " & currentStatus & return
-			end if
-		else if currentStatus starts with "Unreachable" or currentStatus starts with "API" then
-			set summaryText to summaryText & "Status: ❌ " & currentStatus & return
-		else
-			set summaryText to summaryText & "Status: ⚠️ " & currentStatus & return
+	set summaryText to summaryText & "Receiver: " & currentReceiver & return
+	
+	-- Find if this receiver required a retry
+	set requiredRetry to false
+	repeat with j from 1 to count of processedReceivers
+		set receiverTracking to item j of processedReceivers
+		if theIP of receiverTracking is currentReceiver and required_retry of receiverTracking then
+			set requiredRetry to true
+			exit repeat
 		end if
-		
-		set summaryText to summaryText & "Source set: " & currentSource & return & return
-	on error errMsg
-		-- Handle errors in accessing result properties
-		set summaryText to summaryText & "Receiver #" & i & ": [Error displaying result]" & return & return
-		my debugOutput("Error in summary for result " & i & ": " & errMsg)
-	end try
+	end repeat
+	
+	-- Add a symbol to each receiver status
+	if currentStatus starts with "Success" then
+		if requiredRetry then
+			-- Success after retry - show caution symbol
+			set summaryText to summaryText & "Status: ⚠️ " & currentStatus & " (after retry)" & return
+		else
+			-- Success on first try
+			set summaryText to summaryText & "Status: ✅ " & currentStatus & return
+		end if
+	else if currentStatus starts with "Unreachable" or currentStatus starts with "API" then
+		set summaryText to summaryText & "Status: ❌ " & currentStatus & return
+	else
+		set summaryText to summaryText & "Status: ⚠️ " & currentStatus & return
+	end if
+	
+	set summaryText to summaryText & "Source set: " & currentSource & return & return
 end repeat
 
 -- Display the dialog with the appropriate icon
