@@ -1,12 +1,9 @@
 -----------------------------------------------------
 -- NDI Receiver Management Script
--- Author: Original script enhanced with Claude Opus
 -- Version: 2.0
 -- Purpose: Automatically configures NDI receivers to use the correct source
 -----------------------------------------------------
 
-
------------------------------------------------------
 -- Global Variables and Properties
 -----------------------------------------------------
 global jqPath
@@ -14,26 +11,23 @@ global configFileName
 property sessionCookie : ""
 property progressDialog : missing value
 
--- Configuration file name
+-- Configuration file name (easy to update)
 set configFileName to "NDIReceiverConfig.json"
 
-
------------------------------------------------------
--- Startup Processing
------------------------------------------------------
-
--- Find jq path at startup
+-- Find jq path dynamically
 set jqPath to findJQPath()
 if jqPath is "" then
 	display dialog "Could not find jq. Please install jq and try again." & return & return & "You can install jq with Homebrew:" & return & "brew install jq" buttons {"OK"} default button "OK" with icon stop
 	return -- Exit the script
 end if
 
--- Load configuration from external file
+-----------------------------------------------------
+-- Load Configuration
+-----------------------------------------------------
+-- Load configuration from file
 if not loadConfiguration() then
 	return -- Exit if config can't be loaded
 end if
-
 
 -----------------------------------------------------
 -- Main Script
@@ -66,20 +60,20 @@ repeat with receiverIP in receiverList
 	set sessionCookie to ""
 	
 	try
-		-- (A) Ping the receiver to check if it's reachable (optimized)
-		try
-			set pingResponse to do shell script "ping -c 1 -W 0.5 -t 1 " & receiverIP & " 2>&1"
-			logMessage("Ping Response for " & receiverIP & ": " & pingResponse)
-			if pingResponse does not contain "1 packets transmitted, 1 packets received" then
-				set receiverResult's status to "Unreachable (ping failed)"
-				error "Skipping receiver " & receiverIP
-			end if
-		on error pingErr
-			set receiverResult's status to "Unreachable (ping error)"
+		-- (A) Check if receiver is available (both network and API)
+		set availabilityStatus to checkReceiverAvailability(receiverIP)
+		
+		if not availabilityStatus's reachable then
+			set receiverResult's status to "Unreachable (network ping failed)"
 			set receiverResult's source to "N/A"
-			logMessage("Ping error for " & receiverIP & ": " & pingErr)
-			error "Skipping receiver " & receiverIP
-		end try
+			logMessage("Network unreachable for " & receiverIP & ": " & availabilityStatus's message)
+			error "Skipping receiver " & receiverIP & " - network unreachable"
+		else if not availabilityStatus's apiAvailable then
+			set receiverResult's status to "API unavailable"
+			set receiverResult's source to "N/A"
+			logMessage("API unavailable for " & receiverIP & ": " & availabilityStatus's message)
+			error "Skipping receiver " & receiverIP & " - API unavailable"
+		end if
 		
 		-- (B) Login to the receiver using the new session cookie management
 		set loginResponse to loginToReceiver(receiverIP)
@@ -135,7 +129,6 @@ if progressDialog is not missing value then
 	close progressDialog
 end if
 
-
 -----------------------------------------------------
 -- Build and Display the Summary Dialog
 -----------------------------------------------------
@@ -152,7 +145,6 @@ display dialog summaryText buttons {"OK"} default button "OK"
 -----------------------------------------------------
 -- Utility Functions
 -----------------------------------------------------
-
 -- Find jq executable path
 on findJQPath()
 	set possiblePaths to {"/usr/local/bin/jq", "/usr/bin/jq", "/opt/homebrew/bin/jq", "~/bin/jq"}
@@ -191,7 +183,8 @@ on findJQPath()
 	return ""
 end findJQPath
 
--- Load configuration from external JSON file
+
+-- Load configuration from file with flexible location detection
 on loadConfiguration()
 	set configPath to missing value
 	
@@ -366,6 +359,58 @@ on loadConfiguration()
 end loadConfiguration
 
 
+-- Check receiver availability (both network and API)
+on checkReceiverAvailability(receiverIP)
+	set result to {reachable:false, apiAvailable:false, message:""}
+	
+	-- Stage 1: Check basic network connectivity
+	try
+		set pingResponse to do shell script "ping -c 1 -W 0.5 -t 1 " & receiverIP & " 2>&1"
+		if pingResponse contains "1 packets transmitted, 1 packets received" then
+			set result's reachable to true
+			logMessage("Network ping successful for " & receiverIP)
+		else
+			set result's message to "Network ping failed"
+			logMessage("Network ping failed for " & receiverIP)
+			return result
+		end if
+	on error pingErr
+		set result's message to "Network error: " & pingErr
+		logMessage("Network ping error for " & receiverIP & ": " & pingErr)
+		return result
+	end try
+	
+	-- Stage 2: Check API availability
+	try
+		set apiPingURL to "http://" & receiverIP & "/mwapi?method=ping"
+		set apiResponse to do shell script "curl --connect-timeout 2 --silent " & quoted form of apiPingURL
+		
+		-- Verify it's a valid response
+		set isValidResponse to false
+		try
+			set statusCheck to do shell script "echo " & quoted form of apiResponse & " | " & jqPath & " '.status'"
+			if statusCheck as text is "0" then
+				set isValidResponse to true
+			end if
+		end try
+		
+		if isValidResponse then
+			set result's apiAvailable to true
+			set result's message to "Receiver available"
+			logMessage("API ping successful for " & receiverIP)
+		else
+			set result's message to "API ping failed: Invalid response"
+			logMessage("API ping failed for " & receiverIP & ": Invalid response")
+		end if
+	on error apiErr
+		set result's message to "API error: " & apiErr
+		logMessage("API ping error for " & receiverIP & ": " & apiErr)
+	end try
+	
+	return result
+end checkReceiverAvailability
+
+
 -- Login to receiver and capture session cookie
 on loginToReceiver(receiverIP)
 	set loginURL to "http://" & receiverIP & "/mwapi?method=login&id=" & userName & "&pass=" & userPW
@@ -393,7 +438,7 @@ on runCURLWithSession(theURL, connectTimeout)
 end runCURLWithSession
 
 
--- URL Encode function
+-- URL Encode function (unchanged)
 on urlEncode(input)
 	try
 		set encoded to do shell script "python3 -c 'import urllib.parse; print(urllib.parse.quote(\"" & input & "\"))'"
