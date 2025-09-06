@@ -8,6 +8,10 @@
 -----------------------------------------------------
 global jqPath
 global configFileName
+global receiverList
+global userName
+global userPW
+global connectTimeout
 property sessionCookie : ""
 property progressDialog : missing value
 
