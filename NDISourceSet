@@ -48,15 +48,17 @@ end if
 -- Extract configuration values
 set userName to config's userName
 set userPW to config's userPW
-set receiverList to config's receiverList
 set connectTimeout to config's connectTimeout
 set retryAttempts to config's retryAttempts
+set retryDelay to config's retryDelay
 set pingConfig to config's pingConfig
 set pingTimeout to pingTimeout of pingConfig
 set pingAttempts to pingAttempts of pingConfig
 set pingWaitTime to pingWaitTime of pingConfig
+set receiverList to config's receiverList
 debugOutput("Count of receivers to process: " & (count of receiverList))
 debugOutput("Retry attempts configured: " & retryAttempts)
+my debugOutput("Retry delay configured: " & retryDelay)
 debugOutput("Ping configuration: timeout=" & pingTimeout & ", attempts=" & pingAttempts & ", waitTime=" & pingWaitTime)
 
 -- At the beginning of the script, after loading configuration, display warning to user prior to proceeding
@@ -78,10 +80,12 @@ set summaryResults to {}
 my debugOutput("Beginning processing with retry capability (max retry attempts: " & retryAttempts & ")")
 
 -- Create a tracking record for each receiver
+-- Initialize a tracking record for each receiver
 set receiverTrackingList to {}
-repeat with receiverIP in receiverList
-	-- Each record has the IP, result, and tracking flags
-	set receiverRecord to {theIP:receiverIP, theResult:{receiver:receiverIP, status:"Not processed", source:"N/A"}, isSuccess:false, wasRetried:false}
+repeat with receiverInfo in receiverList
+	set receiverIP to theIp of receiverInfo
+	-- Each record has the receiver info, result, and success flags
+	set receiverRecord to {theReceiverInfo:receiverInfo, theResult:{receiver:receiverIP, status:"Not processed", source:"N/A"}, isSuccess:false, wasRetried:false}
 	set end of receiverTrackingList to receiverRecord
 end repeat
 
@@ -104,7 +108,8 @@ repeat until allSuccessful or currentPass > maxPasses
 		-- Only process receivers that haven't succeeded yet
 		if not (isSuccess of receiverRecord) then
 			set processedAny to true
-			set receiverIP to theIP of receiverRecord
+			set receiverInfo to theReceiverInfo of receiverRecord
+			set receiverIP to theIp of receiverInfo
 			
 			-- Show appropriate pass information
 			if currentPass > 1 then
@@ -115,8 +120,8 @@ repeat until allSuccessful or currentPass > maxPasses
 			
 			my debugOutput(passText & "Processing receiver " & receiverIP)
 			
-			-- Process the receiver
-			set receiverResult to processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath, pingTimeout, pingAttempts, pingWaitTime)
+			-- Process the receiver with full receiver info
+			set receiverResult to processReceiver(receiverInfo, userName, userPW, connectTimeout, jqPath, pingTimeout, pingAttempts, pingWaitTime)
 			
 			-- Update the tracking record with the result
 			set theResult of item i of receiverTrackingList to receiverResult
@@ -148,8 +153,64 @@ repeat until allSuccessful or currentPass > maxPasses
 	set currentPass to currentPass + 1
 	
 	if not allSuccessful and currentPass ≤ maxPasses then
-		my debugOutput("Not all successful, waiting 2 seconds before next pass...")
-		delay 2
+		set waitTime to retryDelay
+		
+		-- Count receivers that need retry by checking which ones haven't succeeded
+		set failedCount to 0
+		repeat with i from 1 to count of receiverTrackingList
+			set receiverRecord to item i of receiverTrackingList
+			if not (isSuccess of receiverRecord) then
+				set failedCount to failedCount + 1
+			end if
+		end repeat
+		
+		set totalCount to count of receiverTrackingList
+		set successCount to totalCount - failedCount
+		
+		-- Build the retry message with explicit text conversions
+		set retryMessage to (failedCount as text) & " of " & (totalCount as text) & " receivers failed."
+		set retryMessage to retryMessage & return & return
+		set retryMessage to retryMessage & "Retry pass " & ((currentPass - 1) as text) & " of " & (retryAttempts as text) & " will begin in " & (retryDelay as text) & " seconds."
+		set retryMessage to retryMessage & return & return
+		set retryMessage to retryMessage & "Press Cancel to quit."
+		
+		my debugOutput("Showing retry dialog: " & retryMessage)
+		
+		-- Show the dialog with auto-dismiss after configured delay
+		try
+			display dialog retryMessage buttons {"Cancel"} default button "Cancel" with title "NDI Receiver Retry" with icon caution giving up after retryDelay
+			-- Check if user clicked Cancel
+			if button returned of result is "Cancel" then
+				my debugOutput("User canceled retry.")
+				exit repeat
+			end if
+		on error errMsg
+			if errMsg contains "User canceled" then
+				-- Dialog was canceled by user
+				my debugOutput("User canceled retry.")
+				exit repeat
+			else if errMsg contains "-1708" or errMsg contains "gave up" then
+				-- Dialog timed out, which is what we want
+				my debugOutput("Retry dialog timed out, continuing with next pass.")
+			else
+				-- Some other error occurred
+				my debugOutput("Error with retry dialog: " & errMsg)
+			end if
+		end try
+		
+		-- No additional delay needed since dialog provided it
+	else if not allSuccessful then
+		-- No more retries left, but some receivers still failed
+		set failedCount to 0
+		repeat with i from 1 to count of receiverTrackingList
+			set receiverRecord to item i of receiverTrackingList
+			if not (isSuccess of receiverRecord) then
+				set failedCount to failedCount + 1
+			end if
+		end repeat
+		
+		set totalCount to count of receiverTrackingList
+		my debugOutput("All retry attempts completed. " & (failedCount as text) & " of " & (totalCount as text) & " receivers still failed.")
 	end if
 end repeat
 
@@ -228,14 +289,34 @@ repeat with receiverRecord in receiverTrackingList
 	set currentReceiver to receiver of currentResult
 	set currentStatus to status of currentResult
 	set currentSource to source of currentResult
-	set didRequireRetry to wasRetried of receiverRecord
-	set didSucceed to isSuccess of receiverRecord
+	set wasRetried to wasRetried of receiverRecord
 	
+	-- Get the receiver info to determine what matching was used
+	set receiverInfo to theReceiverInfo of receiverRecord
+	set matchType to theMatchType of receiverInfo
+	set matchPattern to thePattern of receiverInfo
+	set receiverIP to theIp of receiverInfo
+	
+	-- Create the "Source sought" text based on match type
+	set sourceSoughtText to ""
+	if matchType is "ip" then
+		set sourceSoughtText to "Name contains " & receiverIP
+	else if matchType is "contains" then
+		set sourceSoughtText to "Name contains \"" & matchPattern & "\""
+	else if matchType is "exact" then
+		set sourceSoughtText to "Name is \"" & matchPattern & "\""
+	else
+		set sourceSoughtText to "Unknown match type: " & matchType
+	end if
+	
+	-- Build the result text with the new "Source sought" line
 	set summaryText to summaryText & "Receiver: " & currentReceiver & return
+	set summaryText to summaryText & "Source sought: " & sourceSoughtText & return
 	
-	if didSucceed then
-		if didRequireRetry then
-			-- Success after retry
+	-- Add a symbol to each receiver status
+	if currentStatus starts with "Success" then
+		if wasRetried then
+			-- Success after retry - show caution symbol
 			set summaryText to summaryText & "Status: ⚠️ " & currentStatus & " (after retry)" & return
 		else
 			-- Success on first try
@@ -454,7 +535,7 @@ end findConfigFile
 -- Parse a configuration file and extract settings
 on parseConfigFile(configPathPOSIX, jqPath)
 	my debugOutput("Parsing configuration file: " & configPathPOSIX)
-	set configResult to {success:false, userName:"", userPW:"", receiverList:{}, connectTimeout:4, retryAttempts:2, pingConfig:{pingTimeout:1.0, pingAttempts:1, pingWaitTime:0.5}}
+	set configResult to {success:false, userName:"", userPW:"", receiverList:{}, connectTimeout:4, retryAttempts:2, retryDelay:4, pingConfig:{pingTimeout:1.0, pingAttempts:1, pingWaitTime:0.5}}
 	
 	try
 		-- Read the file contents using shell command (more reliable with POSIX paths)
@@ -480,6 +561,7 @@ on parseConfigFile(configPathPOSIX, jqPath)
 	end try
 	
 	-- Extract individual fields with error handling for each
+	
 	-- Extract userName
 	try
 		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.userName'"
@@ -511,43 +593,6 @@ on parseConfigFile(configPathPOSIX, jqPath)
 	on error fieldErr
 		my debugOutput("ERROR extracting userPW: " & fieldErr)
 		display dialog "Error in configuration file: userPW field is invalid or missing." buttons {"OK"} default button "OK" with icon stop
-		return configResult
-	end try
-	
-	-- Extract receiverList
-	try
-		-- Verify receiverList exists and is an array
-		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " '.receiverList | type'"
-		my debugOutput("Checking receiverList type with command: " & jqCmd)
-		set receiverListType to do shell script jqCmd
-		my debugOutput("receiverList type: " & receiverListType)
-		
-		if receiverListType does not contain "array" then
-			my debugOutput("ERROR: receiverList must be an array, found type: " & receiverListType)
-			display dialog "Error in configuration file: receiverList must be an array." buttons {"OK"} default button "OK" with icon stop
-			return configResult
-		end if
-		
-		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[]'"
-		my debugOutput("Extracting receiverList.")
-		set configResult's receiverList to paragraphs of (do shell script jqCmd)
-		
-		-- Create a formatted list with commas for debug output
-		set oldDelimiters to AppleScript's text item delimiters
-		set AppleScript's text item delimiters to ", "
-		set formattedList to configResult's receiverList as text
-		set AppleScript's text item delimiters to oldDelimiters
-		
-		my debugOutput("Extracted " & (count of configResult's receiverList) & " receivers: " & formattedList)
-		
-		if (count of configResult's receiverList) is 0 or configResult's receiverList is {"null"} then
-			my debugOutput("ERROR: receiverList is empty")
-			display dialog "Error in configuration file: receiverList is empty." buttons {"OK"} default button "OK" with icon stop
-			return configResult
-		end if
-	on error fieldErr
-		my debugOutput("ERROR extracting receiverList: " & fieldErr)
-		display dialog "Error in configuration file: receiverList field is invalid or missing." & return & return & fieldErr buttons {"OK"} default button "OK" with icon stop
 		return configResult
 	end try
 	
@@ -614,6 +659,29 @@ on parseConfigFile(configPathPOSIX, jqPath)
 		my debugOutput("Error parsing retryAttempts: " & retryErr & ", using default: " & configResult's retryAttempts)
 	end try
 	
+	-- Extract retryDelay
+	try
+		set hasRetryDelay to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"retryDelay\")'"
+		my debugOutput("Checking if retryDelay exists: " & hasRetryDelay)
+		
+		if hasRetryDelay is "true" then
+			set retryType to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryDelay | type'"
+			my debugOutput("retryDelay type: " & retryType)
+			
+			if retryType contains "number" then
+				set retryValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryDelay'"
+				set configResult's retryDelay to retryValue as number
+				my debugOutput("Using retryDelay from config: " & configResult's retryDelay)
+			else
+				my debugOutput("retryDelay is not a number, using default: " & configResult's retryDelay)
+			end if
+		else
+			my debugOutput("retryDelay not found in config, using default: " & configResult's retryDelay)
+		end if
+	on error retryErr
+		my debugOutput("Error parsing retryDelay: " & retryErr & ", using default: " & configResult's retryDelay)
+	end try
+	
 	-- Extract ping configuration
 	try
 		set hasPingConfig to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"pingConfig\")'"
@@ -657,6 +725,112 @@ on parseConfigFile(configPathPOSIX, jqPath)
 		end if
 	on error configErr
 		my debugOutput("Error parsing pingConfig: " & configErr & ", using defaults")
+	end try
+	
+	-- Extract receiverList - check format first to handle both old and new format
+	try
+		-- Verify receiverList exists and is an array
+		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " '.receiverList | type'"
+		my debugOutput("Checking receiverList type with command: " & jqCmd)
+		set receiverListType to do shell script jqCmd
+		my debugOutput("receiverList type: " & receiverListType)
+		
+		if receiverListType does not contain "array" then
+			my debugOutput("ERROR: receiverList must be an array, found type: " & receiverListType)
+			display dialog "Error in configuration file: receiverList must be an array." buttons {"OK"} default button "OK" with icon stop
+			return configResult
+		end if
+		
+		-- Extract receiverList - check format first to handle both old and new format
+		set firstItemCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[0] | type' 2>/dev/null || echo 'unknown'"
+		set firstItemType to do shell script firstItemCmd
+		my debugOutput("First receiver item type: " & firstItemType)
+		
+		-- Variable to store the processed receiver list
+		set processedReceiverList to {}
+		
+		if firstItemType contains "string" then
+			-- Old format: simple array of IP strings
+			my debugOutput("Using simple receiver list format (IP strings)")
+			set ipListCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[]'"
+			set ipList to paragraphs of (do shell script ipListCmd)
+			
+			-- Convert to new format
+			repeat with currentIP in ipList
+				set receiverInfo to {theIp:currentIP, theMatchType:"ip", thePattern:""}
+				set end of processedReceiverList to receiverInfo
+			end repeat
+			
+			my debugOutput("Converted " & (count of processedReceiverList) & " IP addresses to receiver info objects")
+		else if firstItemType contains "object" then
+			-- New format: array of objects with ip, matchType, and optional pattern
+			my debugOutput("Using enhanced receiver list format (with match types)")
+			set receiverCount to do shell script "echo " & quoted form of configData & " | " & jqPath & " '.receiverList | length'"
+			set receiverCount to receiverCount as number
+			
+			repeat with i from 0 to (receiverCount - 1)
+				-- Extract IP (required)
+				set ipCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[" & i & "].ip'"
+				set currentIP to do shell script ipCmd
+				
+				-- Extract matchType (default to "ip" if missing)
+				set matchTypeCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[" & i & "].matchType // \"ip\"'"
+				set currentMatchType to do shell script matchTypeCmd
+				
+				-- Extract pattern (if applicable)
+				set currentPattern to ""
+				if currentMatchType is not "ip" then
+					set patternCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[" & i & "].pattern // \"\"'"
+					set currentPattern to do shell script patternCmd
+				end if
+				
+				-- Create receiver info record with proper AppleScript naming
+				set receiverInfo to {theIp:currentIP, theMatchType:currentMatchType, thePattern:currentPattern}
+				set end of processedReceiverList to receiverInfo
+				
+				my debugOutput("Parsed receiver " & (i + 1) & ": IP=" & currentIP & ", matchType=" & currentMatchType & ", pattern=" & currentPattern)
+			end repeat
+		else
+			my debugOutput("ERROR: Unknown receiverList format")
+			display dialog "Error in configuration file: Unrecognized receiverList format." buttons {"OK"} default button "OK" with icon stop
+			return configResult
+		end if
+		
+		-- Store the processed list in the config result
+		set configResult's receiverList to processedReceiverList
+		set receiverCount to count of processedReceiverList
+		my debugOutput("Final processed receiver count: " & receiverCount)
+		
+		-- Format list for better debugging display
+		set receiverDescriptions to ""
+		repeat with i from 1 to receiverCount
+			set currentInfo to item i of processedReceiverList
+			set currentIP to theIp of currentInfo
+			set currentMatchType to theMatchType of currentInfo
+			
+			if i > 1 then
+				set receiverDescriptions to receiverDescriptions & ", "
+			end if
+			
+			if currentMatchType is "ip" then
+				set receiverDescriptions to receiverDescriptions & currentIP
+			else
+				set currentPattern to thePattern of currentInfo
+				set receiverDescriptions to receiverDescriptions & currentIP & " (" & currentMatchType & ": " & currentPattern & ")"
+			end if
+		end repeat
+		
+		my debugOutput("Extracted " & receiverCount & " receivers: " & receiverDescriptions)
+		
+		if receiverCount is 0 then
+			my debugOutput("ERROR: receiverList is empty")
+			display dialog "Error in configuration file: receiverList is empty." buttons {"OK"} default button "OK" with icon stop
+			return configResult
+		end if
+	on error fieldErr
+		my debugOutput("ERROR extracting receiverList: " & fieldErr)
+		display dialog "Error in configuration file: receiverList field is invalid or missing." & return & return & fieldErr buttons {"OK"} default button "OK" with icon stop
+		return configResult
 	end try
 	
 	-- Set success flag and return
@@ -849,7 +1023,8 @@ end loginToReceiver
 
 
 -- Process a single receiver and return the result
-on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath, pingTimeout, pingAttempts, pingWaitTime)
+on processReceiver(receiverInfo, userName, userPW, connectTimeout, jqPath, pingTimeout, pingAttempts, pingWaitTime)
+	set receiverIP to theIp of receiverInfo
 	my debugOutput("Starting to process receiver: " & receiverIP)
 	
 	-- Initialize a result record
@@ -890,7 +1065,7 @@ on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath, pingTim
 		
 		-- (D) Find matching source for this receiver
 		my debugOutput("STEP D: Finding matching source for " & receiverIP)
-		set sourceResult to findMatchingSource(jsonResponse, receiverIP, jqPath)
+		set sourceResult to findMatchingSource(jsonResponse, receiverInfo, jqPath)
 		
 		if sourceResult's found then
 			-- (E) Set the receiver's channel to the found source
@@ -922,15 +1097,43 @@ end processReceiver
 
 
 -- Find a matching NDI source for the given receiver
-on findMatchingSource(jsonResponse, receiverIP, jqPath)
+-- Replace your current findMatchingSource function with this enhanced version:
+
+-- Find a matching NDI source for the given receiver
+on findMatchingSource(jsonResponse, receiverInfo, jqPath)
 	-- Create the result record
 	set sourceResult to {found:false, sourceName:"", encodedName:""}
 	
-	-- Use jq with regex to ensure exact IP match
-	-- This matches IPs that are surrounded by non-digits or at string boundaries
-	set jqQuery to ".sources[] | select(.\"ndi-name\" | test(\"[^0-9]" & receiverIP & "[^0-9]|^" & receiverIP & "[^0-9]|[^0-9]" & receiverIP & "$|^" & receiverIP & "$\"))"
+	set receiverIP to theIp of receiverInfo
+	set matchType to matchType of receiverInfo
+	set pattern to pattern of receiverInfo
+	
+	my debugOutput("Finding source for receiver " & receiverIP & " using match type: " & matchType)
+	
+	-- Build the appropriate jq query based on match type
+	set jqQuery to ""
+	
+	if matchType is "ip" then
+		-- IP matching: find sources containing the IP with proper boundaries
+		set jqQuery to ".sources[] | select(.\"ndi-name\" | test(\"[^0-9]" & receiverIP & "[^0-9]|^" & receiverIP & "[^0-9]|[^0-9]" & receiverIP & "$|^" & receiverIP & "$\"))"
+		my debugOutput("Using IP match query for " & receiverIP)
+	else if matchType is "contains" then
+		-- Contains matching: find sources containing the specified pattern
+		set jqQuery to ".sources[] | select(.\"ndi-name\" | contains(\"" & pattern & "\"))"
+		my debugOutput("Using CONTAINS match query for pattern: " & pattern)
+	else if matchType is "exact" then
+		-- Exact matching: find sources with the exact name specified
+		set jqQuery to ".sources[] | select(.\"ndi-name\" == \"" & pattern & "\")"
+		my debugOutput("Using EXACT match query for pattern: " & pattern)
+	else
+		-- Unknown match type - fall back to IP matching
+		my debugOutput("WARNING: Unknown match type '" & matchType & "', falling back to IP matching")
+		set jqQuery to ".sources[] | select(.\"ndi-name\" | test(\"[^0-9]" & receiverIP & "[^0-9]|^" & receiverIP & "[^0-9]|[^0-9]" & receiverIP & "$|^" & receiverIP & "$\"))"
+	end if
+	
+	-- Use jq to find matching sources
 	set targetSourceRaw to do shell script "echo " & quoted form of jsonResponse & " | " & jqPath & " '" & jqQuery & "'"
-	my debugOutput("jq target source for " & receiverIP & ": " & targetSourceRaw)
+	my debugOutput("jq source query result for " & receiverIP & ": " & targetSourceRaw)
 	
 	if targetSourceRaw is not "" then
 		-- Process found source as before
@@ -943,6 +1146,8 @@ on findMatchingSource(jsonResponse, receiverIP, jqPath)
 		set sourceResult's found to true
 		set sourceResult's sourceName to ndiNameRaw
 		set sourceResult's encodedName to encodedNdiName
+	else
+		my debugOutput("No matching source found for receiver " & receiverIP & " with " & matchType & " matching")
 	end if
 	
 	return sourceResult
