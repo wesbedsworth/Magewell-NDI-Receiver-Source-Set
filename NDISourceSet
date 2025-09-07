@@ -8,7 +8,6 @@
 -----------------------------------------------------
 -- Script Properties
 -----------------------------------------------------
-property sessionCookie : ""
 property configFileName : "NDIReceiverConfig.json"
 property debugMode : true -- Enable debug mode
 
@@ -52,9 +51,13 @@ set userPW to config's userPW
 set receiverList to config's receiverList
 set connectTimeout to config's connectTimeout
 set retryAttempts to config's retryAttempts
-my debugOutput("Count of receivers to process: " & (count of receiverList))
-my debugOutput("Retry attempts configured: " & retryAttempts)
-
+set pingConfig to config's pingConfig
+set pingTimeout to pingTimeout of pingConfig
+set pingAttempts to pingAttempts of pingConfig
+set pingWaitTime to pingWaitTime of pingConfig
+debugOutput("Count of receivers to process: " & (count of receiverList))
+debugOutput("Retry attempts configured: " & retryAttempts)
+debugOutput("Ping configuration: timeout=" & pingTimeout & ", attempts=" & pingAttempts & ", waitTime=" & pingWaitTime)
 
 -- At the beginning of the script, after loading configuration, display warning to user prior to proceeding
 display dialog "About to set channels for " & (count of receiverList) & " NDI receivers." & return & return & "This will take a few moments during which there will be no progress indication on the screen." & return & return & "Please be patient. A summary will be displayed when complete." buttons {"OK", "Cancel"} default button "OK"
@@ -71,114 +74,98 @@ set startTimeSeconds to do shell script "date +%s"
 set summaryResults to {}
 
 
--- Replace the entire multi-pass processing loop with this version:
+-- Main multi-pass processing loop with retry logic
+my debugOutput("Beginning processing with retry capability (max retry attempts: " & retryAttempts & ")")
 
--- Main multi-pass processing loop
-set summaryResults to {}
-set remainingReceiverIPs to receiverList
-set processedReceivers to {}
-set currentPass to 1
-set maxPasses to retryAttempts + 1
-
-my debugOutput("Beginning processing with up to " & maxPasses & " passes (" & retryAttempts & " retry attempts)")
-
--- Initialize a tracking record for each receiver
+-- Create a tracking record for each receiver
+set receiverTrackingList to {}
 repeat with receiverIP in receiverList
-	-- Create a dummy result record that will be updated
-	set dummyResult to {receiver:receiverIP, status:"Not processed", source:"N/A"}
-	set theTracking to {theIP:receiverIP, theResult:dummyResult, passNum:0, required_retry:false}
-	set end of processedReceivers to theTracking
+	-- Each record has the IP, result, and tracking flags
+	set receiverRecord to {theIP:receiverIP, theResult:{receiver:receiverIP, status:"Not processed", source:"N/A"}, isSuccess:false, wasRetried:false}
+	set end of receiverTrackingList to receiverRecord
 end repeat
 
--- Continue processing passes until we've either processed all receivers successfully,
--- or we've reached the maximum number of retry attempts
-repeat while ((count of remainingReceiverIPs) > 0) and (currentPass ≤ maxPasses)
-	my debugOutput("Starting pass " & currentPass & " with " & (count of remainingReceiverIPs) & " receivers")
+-- Main loop with retry logic
+set currentPass to 1
+set maxPasses to retryAttempts + 1
+set allSuccessful to false
+
+repeat until allSuccessful or currentPass > maxPasses
+	my debugOutput("Starting pass " & currentPass & " of maximum " & maxPasses & " passes.")
 	
-	-- Display progress info for this pass
-	if currentPass > 1 then
-		set passDisplay to "Retry pass " & (currentPass - 1) & " of " & retryAttempts
-	else
-		set passDisplay to "Initial processing"
-	end if
+	-- Track if we've processed all receivers successfully in this pass
+	set allSuccessful to true
+	set processedAny to false
 	
-	-- Process receivers in this pass
-	set stillFailedReceivers to {}
-	
-	repeat with i from 1 to count of remainingReceiverIPs
-		set receiverIP to item i of remainingReceiverIPs
+	-- Process each receiver that hasn't succeeded yet
+	repeat with i from 1 to count of receiverTrackingList
+		set receiverRecord to item i of receiverTrackingList
 		
-		-- Update progress text
-		set progressText to passDisplay & ": Processing receiver " & i & " of " & (count of remainingReceiverIPs) & ": " & receiverIP
-		my debugOutput(progressText)
-		
-		-- Process the receiver using our modular function
-		set receiverResult to processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
-		
-		-- Update our tracking for this receiver
-		repeat with j from 1 to count of processedReceivers
-			set currentTracking to item j of processedReceivers
+		-- Only process receivers that haven't succeeded yet
+		if not (isSuccess of receiverRecord) then
+			set processedAny to true
+			set receiverIP to theIP of receiverRecord
 			
-			if theIP of currentTracking is receiverIP then
-				-- Update the result
-				set theResult of item j of processedReceivers to receiverResult
-				set passNum of item j of processedReceivers to currentPass
-				
-				-- Mark as requiring retry if this isn't the first pass
-				if currentPass > 1 then
-					set required_retry of item j of processedReceivers to true
-					my debugOutput("Marked receiver " & receiverIP & " as requiring retry")
-				end if
-				
-				exit repeat
-			end if
-		end repeat
-		
-		-- Check if we need to retry this receiver in the next pass
-		if (status of receiverResult) starts with "Success" then
-			-- Success! No need to add to stillFailedReceivers
-			my debugOutput("Receiver " & receiverIP & " succeeded, no retry needed")
-		else
-			-- Failed - add to still failed list for next pass if we have more passes left
-			if currentPass < maxPasses then
-				my debugOutput("Receiver " & receiverIP & " failed, will retry in next pass")
-				set end of stillFailedReceivers to receiverIP
+			-- Show appropriate pass information
+			if currentPass > 1 then
+				set passText to "Retry pass " & (currentPass - 1) & ": "
 			else
-				my debugOutput("Receiver " & receiverIP & " failed in final pass, no more retries")
+				set passText to "Initial pass: "
+			end if
+			
+			my debugOutput(passText & "Processing receiver " & receiverIP)
+			
+			-- Process the receiver
+			set receiverResult to processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath, pingTimeout, pingAttempts, pingWaitTime)
+			
+			-- Update the tracking record with the result
+			set theResult of item i of receiverTrackingList to receiverResult
+			
+			-- If this is a retry, mark it as retried
+			if currentPass > 1 then
+				set wasRetried of item i of receiverTrackingList to true
+			end if
+			
+			-- Check if it succeeded
+			if (status of receiverResult) starts with "Success" then
+				set isSuccess of item i of receiverTrackingList to true
+				my debugOutput("Receiver " & receiverIP & " processed successfully")
+			else
+				-- This receiver failed, so we don't have all successful yet
+				set allSuccessful to false
+				my debugOutput("Receiver " & receiverIP & " failed, may retry in next pass")
 			end if
 		end if
 	end repeat
 	
-	-- Update for next pass
-	set remainingReceiverIPs to stillFailedReceivers
+	-- If we didn't process any receivers in this pass, we're done
+	if not processedAny then
+		my debugOutput("No receivers needed processing in pass " & currentPass)
+		set allSuccessful to true
+	end if
+	
+	-- Increment pass counter and add delay between passes
 	set currentPass to currentPass + 1
 	
-	-- If we need another pass, add a small delay to give devices time to recover
-	if (count of remainingReceiverIPs) > 0 and currentPass ≤ maxPasses then
-		my debugOutput("Waiting 2 seconds before retry pass " & (currentPass - 1) & "...")
-		delay 2 -- Wait 2 seconds between passes
+	if not allSuccessful and currentPass ≤ maxPasses then
+		my debugOutput("Not all successful, waiting 2 seconds before next pass...")
+		delay 2
 	end if
 end repeat
 
--- Build the final results list from our tracking
-my debugOutput("Building final results from tracking data")
-repeat with receiverTracking in processedReceivers
-	set currentResult to theResult of receiverTracking
-	if currentResult is not missing value then
-		set end of summaryResults to currentResult
-		my debugOutput("Added result for " & (receiver of currentResult) & " with status: " & (status of currentResult))
-	else
-		my debugOutput("Warning: Missing result in processed receivers")
-	end if
+-- Build final summary list for compatibility with existing code
+set summaryResults to {}
+repeat with receiverRecord in receiverTrackingList
+	set end of summaryResults to theResult of receiverRecord
 end repeat
 
--- Calculate how many passes we actually did
+-- Add retry information to summary
 set passesCompleted to currentPass - 1
 if passesCompleted > 1 then
 	if passesCompleted > 2 then
-		set retryInfo to "Completed " & passesCompleted & " passes (original + " & (passesCompleted - 1) & " retry passes)"
+		set retryInfo to "Completed " & passesCompleted & " passes (initial + " & (passesCompleted - 1) & " retry passes)"
 	else
-		set retryInfo to "Completed " & passesCompleted & " passes (original + " & (passesCompleted - 1) & " retry pass)"
+		set retryInfo to "Completed " & passesCompleted & " passes (initial + " & (passesCompleted - 1) & " retry pass)"
 	end if
 else
 	set retryInfo to "Completed in a single pass (no retries needed)"
@@ -192,27 +179,26 @@ set elapsedSeconds to (endTimeSeconds as number) - (startTimeSeconds as number)
 set elapsedFormatted to my formatSeconds(elapsedSeconds)
 
 
--- Replace the summary analysis and display section with this version:
-
 -- Analyze the overall status
-my debugOutput("Analyzing results for " & (count of summaryResults) & " receivers")
-set totalReceivers to count of summaryResults
+set totalReceivers to count of receiverTrackingList
 set successCount to 0
+set retryCount to 0
 set failCount to 0
 
-repeat with i from 1 to count of summaryResults
-	set currentResult to item i of summaryResults
-	set currentStatus to status of currentResult
-	
-	my debugOutput("Analyzing result " & i & " with status: " & currentStatus)
-	if currentStatus starts with "Success" then
+repeat with receiverRecord in receiverTrackingList
+	if isSuccess of receiverRecord then
 		set successCount to successCount + 1
+		
+		-- Count how many succeeded after a retry
+		if wasRetried of receiverRecord then
+			set retryCount to retryCount + 1
+		end if
 	else
 		set failCount to failCount + 1
 	end if
 end repeat
 
-my debugOutput("Analysis complete: " & successCount & " succeeded, " & failCount & " failed")
+my debugOutput("Results: " & successCount & " of " & totalReceivers & " successful (" & retryCount & " required retry), " & failCount & " failed.")
 
 -- Determine the appropriate icon based on success/failure ratio
 set dialogIcon to missing value
@@ -233,34 +219,23 @@ else
 end if
 
 -- Build and Display the Summary Dialog
-set summaryText to "NDI Receiver Summary:" & return & return
-set summaryText to summaryText & statusSummary & return & return
-set summaryText to summaryText & retryInfo & return & return
-set summaryText to summaryText & "Total time: " & elapsedFormatted & return & return
+my debugOutput("Preparing summary report.")
+set summaryText to "NDI Receiver Summary:" & return & return & statusSummary & return & return & "Total time: " & elapsedFormatted & return & return
 
 -- Display detailed results
-repeat with i from 1 to count of summaryResults
-	set currentResult to item i of summaryResults
+repeat with receiverRecord in receiverTrackingList
+	set currentResult to theResult of receiverRecord
 	set currentReceiver to receiver of currentResult
 	set currentStatus to status of currentResult
 	set currentSource to source of currentResult
+	set didRequireRetry to wasRetried of receiverRecord
+	set didSucceed to isSuccess of receiverRecord
 	
 	set summaryText to summaryText & "Receiver: " & currentReceiver & return
 	
-	-- Find if this receiver required a retry
-	set requiredRetry to false
-	repeat with j from 1 to count of processedReceivers
-		set receiverTracking to item j of processedReceivers
-		if theIP of receiverTracking is currentReceiver and required_retry of receiverTracking then
-			set requiredRetry to true
-			exit repeat
-		end if
-	end repeat
-	
-	-- Add a symbol to each receiver status
-	if currentStatus starts with "Success" then
-		if requiredRetry then
-			-- Success after retry - show caution symbol
+	if didSucceed then
+		if didRequireRetry then
+			-- Success after retry
 			set summaryText to summaryText & "Status: ⚠️ " & currentStatus & " (after retry)" & return
 		else
 			-- Success on first try
@@ -322,157 +297,107 @@ on findJQPath()
 end findJQPath
 
 
--- Load configuration from file with flexible location detection
-on loadConfiguration(jqPath)
-	debugOutput("Loading NDI Receiver configuration JSON file.")
-	set configResult to {success:false, userName:"", userPW:"", receiverList:{}, connectTimeout:4, retryAttempts:2}
-	set configPath to missing value
-	
-	-- Determine if QLab is running, and if a workspace is open
+-- Check if QLab is running using bundle identifier
+on isQLabRunning()
 	my debugOutput("Checking if QLab is running.")
-	set runningInQLab to false
 	
 	try
-		-- Check for QLab in a more resilient way
-		set checkCmd to "ps -A | grep -v grep | grep -c \"QLab$\" || echo 0"
-		set appCountStr to do shell script checkCmd
+		-- Use the bundle identifier for a more precise check
+		set checkCmd to "osascript -e 'tell application \"System Events\" to return (exists process \"QLab\")'"
+		set isRunning to do shell script checkCmd
 		
-		-- Convert to number safely
-		set appCount to 0
-		try
-			set appCount to appCountStr as number
-		on error
-			set appCount to 0
-		end try
-		
-		if appCount > 0 then
-			my debugOutput("QLab is running (detected " & appCount & " instance(s)).")
-			-- Now it's safe to communicate with QLab
+		if isRunning is "true" then
+			my debugOutput("QLab is running.")
+			
+			-- Check if there's an open workspace
 			try
+				-- Only attempt to communicate with QLab if it's running
 				tell application "QLab"
 					if exists front workspace then
-						set runningInQLab to true
-						my debugOutput("QLab has an open workspace. Looking for config file there.")
+						my debugOutput("QLab has an open workspace.")
+						return {isRunning:true, hasWorkspace:true}
 					else
-						my debugOutput("QLab is running but no workspace is open.")
+						my debugOutput("QLab does not have an open workspace.")
+						return {isRunning:true, hasWorkspace:false}
 					end if
 				end tell
-			on error qlabErr
-				my debugOutput("Error checking QLab workspace: " & qlabErr)
+			on error workspaceErr
+				my debugOutput("Error checking QLab workspace: " & workspaceErr)
+				return {isRunning:true, hasWorkspace:false}
 			end try
 		else
-			my debugOutput("QLab is not running. Will not check for QLab workspace.")
+			my debugOutput("QLab is not running.")
+			return {isRunning:false, hasWorkspace:false}
 		end if
 	on error checkErr
-		my debugOutput("Error in process check: " & checkErr)
-		set runningInQLab to false
+		my debugOutput("Error checking if QLab is running: " & checkErr)
+		return {isRunning:false, hasWorkspace:false}
 	end try
+end isQLabRunning
+
+
+-- Find the configuration file based on context
+on findConfigFile(configFileName)
+	set configPath to missing value
+	set configResult to {found:false, filePath:""}
 	
-	my debugOutput("Running in QLab context: " & runningInQLab)
+	my debugOutput("Searching for configuration file: " & configFileName)
+	
+	-- Check if we're running in QLab
+	set qlabStatus to isQLabRunning()
+	set runningInQLab to isRunning of qlabStatus and hasWorkspace of qlabStatus
 	
 	-- Try to find config based on context (QLab or standalone)
 	if runningInQLab then
 		-- In QLab: Look for config file relative to the current workspace
 		try
-			-- Using temporary variables outside of tell block
-			set foundConfig to false
-			set tempPath to ""
-			
 			tell application "QLab"
 				if exists front workspace then
-					set qLabPath to path of front workspace
-					set tempPath to qLabPath
+					-- Get path which is apparently already in POSIX format in QLab 5
+					set qLabPathPOSIX to path of front workspace as text
+					my debugOutput("QLab workspace path: " & qLabPathPOSIX)
+					
+					-- Use dirname to get the directory
+					set showfolderPOSIX to do shell script "dirname " & quoted form of qLabPathPOSIX
+					set configPathPOSIX to showfolderPOSIX & "/" & configFileName
+					my debugOutput("Looking for config at: " & configPathPOSIX)
+					
+					-- Check if file exists using shell command
+					set fileCheckCmd to "test -f " & quoted form of configPathPOSIX & " && echo 'true' || echo 'false'"
+					set fileExists to (do shell script fileCheckCmd) is "true"
+					
+					if fileExists then
+						set configPath to configPathPOSIX
+						my debugOutput("Found config file in QLab workspace folder: " & configPath)
+					else
+						my debugOutput("Config file not found in QLab workspace folder")
+					end if
 				end if
 			end tell
-			
-			-- Process the path outside the tell block
-			if tempPath is not "" then
-				my debugOutput("QLab workspace path: " & tempPath)
-				-- Extract directory from the full path
-				set showfileFolder to do shell script "dirname " & quoted form of tempPath
-				set defaultConfigPath to showfileFolder & "/" & configFileName
-				my debugOutput("Looking for config at: " & defaultConfigPath)
-				
-				-- Check if config exists in the showfile's directory
-				set fileExists to false
-				tell application "System Events"
-					if exists file defaultConfigPath then
-						set fileExists to true
-					end if
-				end tell
-				
-				if fileExists then
-					set configPath to defaultConfigPath
-					my debugOutput("Found config file in QLab workspace folder: " & configPath)
-				else
-					my debugOutput("Config file not found in QLab workspace folder")
-				end if
-			else
-				my debugOutput("No front workspace in QLab")
-			end if
 		on error qlabErr
 			my debugOutput("Error checking QLab workspace location: " & qlabErr)
 		end try
 	else
 		-- Standalone: Look for config in the script's directory
 		try
-			set scriptPath to path to me
-			my debugOutput("Script path: " & scriptPath)
+			-- Get script path in POSIX format
+			set scriptPathPOSIX to POSIX path of (path to me)
+			my debugOutput("Script POSIX path: " & scriptPathPOSIX)
 			
-			-- Get the container in a more robust way
-			set scriptFolder to ""
-			try
-				-- Extract the path up to the last colon
-				set scriptPathText to scriptPath as text
-				set lastColonOffset to offset of ":" in (reverse of characters of scriptPathText) as text
-				if lastColonOffset > 0 then
-					set scriptFolder to text 1 thru -((lastColonOffset) + 1) of scriptPathText
-					my debugOutput("Script folder: " & scriptFolder)
-				else
-					-- Fallback method
-					tell application "System Events"
-						set scriptFolder to POSIX path of (container of scriptPath as alias)
-						set scriptFolder to "Macintosh HD:" & text 2 thru end of scriptFolder
-						my debugOutput("Script folder (fallback method): " & scriptFolder)
-					end tell
-				end if
-			on error containerErr
-				my debugOutput("Error getting script container: " & containerErr)
-				-- Second fallback - use dirname
-				try
-					set scriptPathPOSIX to POSIX path of scriptPath
-					set scriptFolder to do shell script "dirname " & quoted form of scriptPathPOSIX
-					set scriptFolder to "Macintosh HD" & scriptFolder
-					my debugOutput("Script folder (dirname method): " & scriptFolder)
-				on error dirnameErr
-					my debugOutput("Error getting script folder with dirname: " & dirnameErr)
-					set scriptFolder to ""
-				end try
-			end try
+			-- Use dirname to get the directory
+			set scriptFolderPOSIX to do shell script "dirname " & quoted form of scriptPathPOSIX
+			set configPathPOSIX to scriptFolderPOSIX & "/" & configFileName
+			my debugOutput("Looking for config at: " & configPathPOSIX)
 			
-			if scriptFolder is not "" then
-				set defaultConfigPath to scriptFolder & ":" & configFileName
-				my debugOutput("Looking for config at: " & defaultConfigPath)
-				
-				set fileExists to false
-				try
-					tell application "System Events"
-						if exists file defaultConfigPath then
-							set fileExists to true
-						end if
-					end tell
-					
-					if fileExists then
-						set configPath to defaultConfigPath
-						my debugOutput("Found config file in script folder: " & configPath)
-					else
-						my debugOutput("Config file not found in script folder")
-					end if
-				on error existsErr
-					my debugOutput("Error checking if file exists: " & existsErr)
-				end try
+			-- Check if file exists using shell command
+			set fileCheckCmd to "test -f " & quoted form of configPathPOSIX & " && echo 'true' || echo 'false'"
+			set fileExists to (do shell script fileCheckCmd) is "true"
+			
+			if fileExists then
+				set configPath to configPathPOSIX
+				my debugOutput("Found config file in script folder: " & configPath)
 			else
-				my debugOutput("Could not determine script folder")
+				my debugOutput("Config file not found in script folder")
 			end if
 		on error scriptErr
 			my debugOutput("Error checking script location: " & scriptErr)
@@ -481,18 +406,17 @@ on loadConfiguration(jqPath)
 	
 	-- If still not found, try Documents folder as a fallback
 	if configPath is missing value then
-		set docsConfigPath to (path to documents folder as text) & configFileName
-		my debugOutput("Looking for config in Documents folder: " & docsConfigPath)
+		-- Get documents folder in POSIX format
+		set docsFolderPOSIX to POSIX path of (path to documents folder)
+		set configPathPOSIX to docsFolderPOSIX & configFileName
+		my debugOutput("Looking for config in Documents folder: " & configPathPOSIX)
 		
-		set fileExists to false
-		tell application "System Events"
-			if exists file docsConfigPath then
-				set fileExists to true
-			end if
-		end tell
+		-- Check if file exists using shell command
+		set fileCheckCmd to "test -f " & quoted form of configPathPOSIX & " && echo 'true' || echo 'false'"
+		set fileExists to (do shell script fileCheckCmd) is "true"
 		
 		if fileExists then
-			set configPath to docsConfigPath
+			set configPath to configPathPOSIX
 			my debugOutput("Found config file in Documents folder: " & configPath)
 		else
 			my debugOutput("Config file not found in Documents folder")
@@ -506,7 +430,8 @@ on loadConfiguration(jqPath)
 			set userPrompt to "Configuration file (" & configFileName & ") not found." & return & return & "Please select the configuration file:"
 			set defaultLocation to path to documents folder
 			set selectedFile to choose file with prompt userPrompt default location defaultLocation
-			set configPath to selectedFile as text
+			-- Convert selected file to POSIX path
+			set configPath to POSIX path of selectedFile
 			my debugOutput("User selected config file: " & configPath)
 		on error selectErr
 			my debugOutput("User canceled file selection or error occurred: " & selectErr)
@@ -515,113 +440,133 @@ on loadConfiguration(jqPath)
 		end try
 	end if
 	
-	-- Now validate and parse the JSON file
-	my debugOutput("Attempting to read config file: " & configPath)
+	-- Return the result
+	if configPath is not missing value then
+		set found of configResult to true
+		set filePath of configResult to configPath
+		my debugOutput("Configuration file found at: " & configPath)
+	end if
+	
+	return configResult
+end findConfigFile
+
+
+-- Parse a configuration file and extract settings
+on parseConfigFile(configPathPOSIX, jqPath)
+	my debugOutput("Parsing configuration file: " & configPathPOSIX)
+	set configResult to {success:false, userName:"", userPW:"", receiverList:{}, connectTimeout:4, retryAttempts:2, pingConfig:{pingTimeout:1.0, pingAttempts:1, pingWaitTime:0.5}}
+	
 	try
-		set configFile to open for access configPath
-		set configData to read configFile
-		close access configFile
-		my debugOutput("Successfully read config file, validating JSON structure.")
+		-- Read the file contents using shell command (more reliable with POSIX paths)
+		set readCmd to "cat " & quoted form of configPathPOSIX
+		set configData to do shell script readCmd
+		my debugOutput("Successfully read config file, validating JSON structure")
+	on error readErr
+		my debugOutput("Error reading config file: " & readErr)
+		display dialog "Failed to read configuration file: " & readErr buttons {"OK"} default button "OK" with icon stop
+		return configResult
+	end try
+	
+	-- Validate JSON structure before extracting fields
+	try
+		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " ."
+		my debugOutput("Validating JSON structure with command: " & jqCmd)
+		do shell script jqCmd
+		my debugOutput("JSON structure validation successful")
+	on error jqError
+		my debugOutput("JSON validation error: " & jqError)
+		display dialog "The configuration file contains invalid JSON:" & return & return & jqError buttons {"OK"} default button "OK" with icon stop
+		return configResult
+	end try
+	
+	-- Extract individual fields with error handling for each
+	-- Extract userName
+	try
+		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.userName'"
+		my debugOutput("Extracting userName with command: " & jqCmd)
+		set configResult's userName to do shell script jqCmd
+		my debugOutput("Extracted userName: " & configResult's userName)
 		
-		-- Validate JSON structure before extracting fields
-		try
-			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " ."
-			my debugOutput("Validating JSON structure.")
-			do shell script jqCmd
-			my debugOutput("JSON structure validation successful")
-		on error jqError
-			my debugOutput("JSON validation error: " & jqError)
-			display dialog "The configuration file contains invalid JSON:" & return & return & jqError buttons {"OK"} default button "OK" with icon stop
+		if configResult's userName is "" or configResult's userName is "null" then
+			my debugOutput("ERROR: userName is missing or empty")
+			error "userName is missing or empty"
+		end if
+	on error fieldErr
+		my debugOutput("ERROR extracting userName: " & fieldErr)
+		display dialog "Error in configuration file: userName field is invalid or missing." buttons {"OK"} default button "OK" with icon stop
+		return configResult
+	end try
+	
+	-- Extract userPW
+	try
+		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.userPW'"
+		my debugOutput("Extracting userPW with command: " & jqCmd)
+		set configResult's userPW to do shell script jqCmd
+		my debugOutput("Extracted userPW: [REDACTED]") -- Don't log actual password
+		
+		if configResult's userPW is "" or configResult's userPW is "null" then
+			my debugOutput("ERROR: userPW is missing or empty")
+			error "userPW is missing or empty"
+		end if
+	on error fieldErr
+		my debugOutput("ERROR extracting userPW: " & fieldErr)
+		display dialog "Error in configuration file: userPW field is invalid or missing." buttons {"OK"} default button "OK" with icon stop
+		return configResult
+	end try
+	
+	-- Extract receiverList
+	try
+		-- Verify receiverList exists and is an array
+		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " '.receiverList | type'"
+		my debugOutput("Checking receiverList type with command: " & jqCmd)
+		set receiverListType to do shell script jqCmd
+		my debugOutput("receiverList type: " & receiverListType)
+		
+		if receiverListType does not contain "array" then
+			my debugOutput("ERROR: receiverList must be an array, found type: " & receiverListType)
+			display dialog "Error in configuration file: receiverList must be an array." buttons {"OK"} default button "OK" with icon stop
 			return configResult
-		end try
+		end if
 		
-		-- Extract individual fields with error handling for each
-		try
-			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.userName'"
-			my debugOutput("Extracting userName.")
-			set configResult's userName to do shell script jqCmd
-			my debugOutput("Extracted userName: " & configResult's userName)
-			
-			if configResult's userName is "" or configResult's userName is "null" then
-				my debugOutput("ERROR: userName is missing or empty.")
-				error "userName is missing or empty"
-			end if
-		on error fieldErr
-			my debugOutput("ERROR extracting userName: " & fieldErr)
-			display dialog "Error in configuration file: userName field is invalid or missing." buttons {"OK"} default button "OK" with icon stop
+		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[]'"
+		my debugOutput("Extracting receiverList.")
+		set configResult's receiverList to paragraphs of (do shell script jqCmd)
+		
+		-- Create a formatted list with commas for debug output
+		set oldDelimiters to AppleScript's text item delimiters
+		set AppleScript's text item delimiters to ", "
+		set formattedList to configResult's receiverList as text
+		set AppleScript's text item delimiters to oldDelimiters
+		
+		my debugOutput("Extracted " & (count of configResult's receiverList) & " receivers: " & formattedList)
+		
+		if (count of configResult's receiverList) is 0 or configResult's receiverList is {"null"} then
+			my debugOutput("ERROR: receiverList is empty")
+			display dialog "Error in configuration file: receiverList is empty." buttons {"OK"} default button "OK" with icon stop
 			return configResult
-		end try
-		
-		try
-			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.userPW'"
-			my debugOutput("Extracting userPW.")
-			set configResult's userPW to do shell script jqCmd
-			my debugOutput("Extracted userPW: " & configResult's userPW)
-			
-			if configResult's userPW is "" or configResult's userPW is "null" then
-				my debugOutput("ERROR: userPW is missing or empty")
-				error "userPW is missing or empty"
-			end if
-		on error fieldErr
-			my debugOutput("ERROR extracting userPW: " & fieldErr)
-			display dialog "Error in configuration file: userPW field is invalid or missing." buttons {"OK"} default button "OK" with icon stop
-			return configResult
-		end try
-		
-		try
-			-- Verify receiverList exists and is an array
-			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " '.receiverList | type'"
-			my debugOutput("Checking receiverList type.")
-			set receiverListType to do shell script jqCmd
-			my debugOutput("receiverList type: " & receiverListType)
-			
-			if receiverListType does not contain "array" then
-				my debugOutput("ERROR: receiverList must be an array, found type: " & receiverListType)
-				display dialog "Error in configuration file: receiverList must be an array." buttons {"OK"} default button "OK" with icon stop
-				return configResult
-			end if
-			
-			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.receiverList[]'"
-			my debugOutput("Extracting receiverList.")
-			set configResult's receiverList to paragraphs of (do shell script jqCmd)
-			my debugOutput("Extracted " & (count of configResult's receiverList) & " receivers: " & (configResult's receiverList as text))
-			
-			if (count of configResult's receiverList) is 0 or configResult's receiverList is {"null"} then
-				my debugOutput("ERROR: receiverList is empty")
-				display dialog "Error in configuration file: receiverList is empty." buttons {"OK"} default button "OK" with icon stop
-				return configResult
-			end if
-		on error fieldErr
-			my debugOutput("ERROR extracting receiverList: " & fieldErr)
-			display dialog "Error in configuration file: receiverList field is invalid or missing." & return & return & fieldErr buttons {"OK"} default button "OK" with icon stop
-			return configResult
-		end try
-		
-		-- First check if the connectTimeout field exists at all
-		set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"connectTimeout\")'"
-		my debugOutput("Checking if connectTimeout exists.")
-		set hasTimeout to do shell script jqCmd
-		my debugOutput("connectTimeout exists: " & hasTimeout)
+		end if
+	on error fieldErr
+		my debugOutput("ERROR extracting receiverList: " & fieldErr)
+		display dialog "Error in configuration file: receiverList field is invalid or missing." & return & return & fieldErr buttons {"OK"} default button "OK" with icon stop
+		return configResult
+	end try
+	
+	-- Extract connectTimeout
+	try
+		-- Check if connectTimeout exists
+		set hasTimeout to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"connectTimeout\")'"
+		my debugOutput("Checking if connectTimeout exists: " & hasTimeout)
 		
 		if hasTimeout is "true" then
-			-- Field exists, get its value and check its type
-			set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout | type'"
-			my debugOutput("Checking connectTimeout type.")
-			set timeoutType to do shell script jqCmd
+			set timeoutType to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout | type'"
 			my debugOutput("connectTimeout type: " & timeoutType)
 			
 			if timeoutType contains "number" then
-				-- It's a number, use it directly
-				set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
-				my debugOutput("Extracting connectTimeout (number).")
-				set timeoutValue to do shell script jqCmd
+				set timeoutValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
 				set configResult's connectTimeout to timeoutValue as number
-				my debugOutput("Set connectTimeout to: " & configResult's connectTimeout)
+				my debugOutput("Using connectTimeout from config: " & configResult's connectTimeout)
 			else if timeoutType contains "string" then
-				-- It's a string, try to convert to number
-				set jqCmd to "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
-				my debugOutput("Extracting connectTimeout (string).")
-				set timeoutStr to do shell script jqCmd
+				set timeoutStr to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.connectTimeout'"
 				my debugOutput("Got connectTimeout string: " & timeoutStr)
 				try
 					set configResult's connectTimeout to timeoutStr as number
@@ -632,122 +577,220 @@ on loadConfiguration(jqPath)
 					return configResult
 				end try
 			else if timeoutType contains "null" then
-				-- It's explicitly null, use default
 				set configResult's connectTimeout to 4
 				my debugOutput("connectTimeout is null, using default: 4")
 			else
-				-- It's some other type (boolean, object, array)
 				my debugOutput("ERROR: connectTimeout has invalid type: " & timeoutType)
 				display dialog "Error in configuration file: connectTimeout must be a number, got " & timeoutType buttons {"OK"} default button "OK" with icon stop
 				return configResult
 			end if
 		else
-			-- Field doesn't exist at all, use default
-			set configResult's connectTimeout to 4
 			my debugOutput("connectTimeout not found in config, using default: 4")
 		end if
-		
-		-- Check for retryAttempts in config
-		set configResult's retryAttempts to 2 -- Default value
-		try
-			set hasRetryAttempts to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"retryAttempts\")'"
-			my debugOutput("Checking if retryAttempts exists: " & hasRetryAttempts)
-			
-			if hasRetryAttempts is "true" then
-				set retryType to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryAttempts | type'"
-				my debugOutput("retryAttempts type: " & retryType)
-				
-				if retryType contains "number" then
-					set retryValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryAttempts'"
-					set configResult's retryAttempts to retryValue as number
-					my debugOutput("Using retryAttempts from config: " & configResult's retryAttempts)
-				else
-					my debugOutput("retryAttempts is not a number, using default: " & configResult's retryAttempts)
-				end if
-			else
-				my debugOutput("retryAttempts not found in config, using default: " & configResult's retryAttempts)
-			end if
-		on error retryErr
-			my debugOutput("Error parsing retryAttempts: " & retryErr & ", using default: " & configResult's retryAttempts)
-		end try
-		
-		set configResult's success to true
-		my debugOutput("Configuration loaded successfully from: " & configPath)
-		return configResult
-	on error errMsg
-		my debugOutput("Failed to load configuration: " & errMsg)
-		display dialog "Failed to load configuration: " & errMsg buttons {"OK"} default button "OK" with icon stop
-		return configResult
+	on error timeoutErr
+		my debugOutput("Error extracting connectTimeout: " & timeoutErr & ", using default: 4")
 	end try
+	
+	-- Extract retryAttempts
+	try
+		set hasRetryAttempts to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"retryAttempts\")'"
+		my debugOutput("Checking if retryAttempts exists: " & hasRetryAttempts)
+		
+		if hasRetryAttempts is "true" then
+			set retryType to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryAttempts | type'"
+			my debugOutput("retryAttempts type: " & retryType)
+			
+			if retryType contains "number" then
+				set retryValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.retryAttempts'"
+				set configResult's retryAttempts to retryValue as number
+				my debugOutput("Using retryAttempts from config: " & configResult's retryAttempts)
+			else
+				my debugOutput("retryAttempts is not a number, using default: " & configResult's retryAttempts)
+			end if
+		else
+			my debugOutput("retryAttempts not found in config, using default: " & configResult's retryAttempts)
+		end if
+	on error retryErr
+		my debugOutput("Error parsing retryAttempts: " & retryErr & ", using default: " & configResult's retryAttempts)
+	end try
+	
+	-- Extract ping configuration
+	try
+		set hasPingConfig to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r 'has(\"pingConfig\")'"
+		my debugOutput("Checking if pingConfig exists: " & hasPingConfig)
+		
+		if hasPingConfig is "true" then
+			-- Extract ping timeout
+			try
+				set timeoutValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.pingConfig.pingTimeout'"
+				if timeoutValue is not "null" then
+					set configResult's pingConfig's pingTimeout to timeoutValue as number
+					my debugOutput("Using ping timeout from config: " & configResult's pingConfig's pingTimeout)
+				end if
+			on error
+				my debugOutput("Using default ping timeout: " & configResult's pingConfig's pingTimeout)
+			end try
+			
+			-- Extract ping attempts
+			try
+				set attemptsValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.pingConfig.pingAttempts'"
+				if attemptsValue is not "null" then
+					set configResult's pingConfig's pingAttempts to attemptsValue as number
+					my debugOutput("Using ping attempts from config: " & configResult's pingConfig's pingAttempts)
+				end if
+			on error
+				my debugOutput("Using default ping attempts: " & configResult's pingConfig's pingAttempts)
+			end try
+			
+			-- Extract ping wait time
+			try
+				set waitValue to do shell script "echo " & quoted form of configData & " | " & jqPath & " -r '.pingConfig.pingWaitTime'"
+				if waitValue is not "null" then
+					set configResult's pingConfig's pingWaitTime to waitValue as number
+					my debugOutput("Using ping wait time from config: " & configResult's pingConfig's pingWaitTime)
+				end if
+			on error
+				my debugOutput("Using default ping wait time: " & configResult's pingConfig's pingWaitTime)
+			end try
+		else
+			my debugOutput("pingConfig not found in config, using defaults")
+		end if
+	on error configErr
+		my debugOutput("Error parsing pingConfig: " & configErr & ", using defaults")
+	end try
+	
+	-- Set success flag and return
+	set configResult's success to true
+	my debugOutput("Configuration parsed successfully")
+	return configResult
+end parseConfigFile
+
+
+-- Load configuration: wrapper function that combines finding and parsing
+on loadConfiguration(jqPath)
+	my debugOutput("Starting configuration loading")
+	
+	-- Find the configuration file
+	set fileResult to findConfigFile(configFileName)
+	
+	if not (found of fileResult) then
+		my debugOutput("Configuration file not found")
+		return {success:false}
+	end if
+	
+	-- Parse the configuration file using the POSIX path
+	set configPath to filePath of fileResult
+	set configResult to parseConfigFile(configPath, jqPath)
+	
+	return configResult
 end loadConfiguration
 
 
 -- Check receiver availability (both network and API)
-on checkReceiverAvailability(receiverIP, jqPath)
-	-- Initialize all local variables at the start
+on checkReceiverAvailability(receiverIP, jqPath, pingTimeout, pingAttempts, pingWaitTime)
+	set availabilityResult to {reachable:false, apiAvailable:false, message:""}
+	
+	-- Stage 1: Check basic network connectivity with configurable parameters
+	my debugOutput("Starting network ping check for " & receiverIP & " (timeout=" & pingTimeout & ", attempts=" & pingAttempts & ")")
+	
 	set pingSuccess to false
-	set apiSuccess to false
-	set errorMessage to ""
+	set attemptCount to 0
 	
-	-- Debug timestamp before network check
-	debugOutput("Starting network ping check for " & receiverIP)
+	repeat pingAttempts times
+		set attemptCount to attemptCount + 1
+		my debugOutput("Ping attempt " & attemptCount & " of " & pingAttempts)
+		
+		try
+			-- Construct ping command with configurable parameters
+			set pingCmd to "ping -c 1 -W " & pingTimeout & " -t " & pingTimeout & " " & receiverIP & " 2>&1 || echo 'Ping timeout'"
+			my debugOutput("Running ping command: " & pingCmd)
+			
+			set pingResponse to do shell script pingCmd
+			my debugOutput("Raw ping response for " & receiverIP & ": " & pingResponse)
+			
+			-- Check for packet loss rate directly from the ping output
+			try
+				-- Extract the packet loss percentage as a number
+				set extractCmd to "echo " & quoted form of pingResponse & " | grep -o '[0-9]\\+\\(\\.[0-9]\\+\\)\\?% packet loss' | grep -o '[0-9]\\+\\(\\.[0-9]\\+\\)\\?'"
+				set lossPercentageStr to do shell script extractCmd
+				my debugOutput("Extracted loss percentage: " & lossPercentageStr)
+				
+				-- Convert to number for comparison
+				set lossPercentage to lossPercentageStr as number
+				my debugOutput("Loss percentage as number: " & lossPercentage)
+				
+				-- Check if loss percentage is 0
+				if lossPercentage = 0 then
+					my debugOutput("PING SUCCESS: 0% packet loss")
+					set pingSuccess to true
+					exit repeat
+				else
+					my debugOutput("PING FAILURE: " & lossPercentage & "% packet loss")
+					-- Continue to next attempt
+				end if
+			on error extractErr
+				-- If we can't extract the percentage, check for timeout
+				if pingResponse contains "Ping timeout" then
+					my debugOutput("PING FAILURE: Timeout detected")
+					-- Continue to next attempt
+				else if pingResponse contains "1 packets transmitted, 1 packets received" or ¬
+					pingResponse contains "1 packets transmitted, 1 received" then
+					my debugOutput("PING SUCCESS: Explicit success pattern")
+					set pingSuccess to true
+					exit repeat
+				else
+					my debugOutput("PING FAILURE: Could not determine status - " & extractErr)
+					-- Continue to next attempt
+				end if
+			end try
+			
+			-- Wait between attempts if not successful and not the last attempt
+			if not pingSuccess and attemptCount < pingAttempts then
+				my debugOutput("Waiting " & pingWaitTime & " seconds before next ping attempt")
+				delay pingWaitTime
+			end if
+		on error pingErr
+			my debugOutput("Ping error on attempt " & attemptCount & " for " & receiverIP & ": " & pingErr)
+			
+			-- Wait between attempts if not the last attempt
+			if attemptCount < pingAttempts then
+				my debugOutput("Waiting " & pingWaitTime & " seconds before next ping attempt")
+				delay pingWaitTime
+			end if
+		end try
+	end repeat
 	
-	-- Stage 1: Check basic network connectivity with strict timeout
-	try
-		-- Use a very short timeout to avoid hanging - with debugging output
-		set pingCmd to "ping -c 1 -W 0.5 -t 1 " & receiverIP & " 2>&1 || echo 'Ping timeout'"
-		debugOutput("Running ping command: " & pingCmd)
-		
-		set pingResponse to do shell script pingCmd
-		
-		-- Log raw response for debugging
-		debugOutput("Raw ping response for " & receiverIP & ": " & pingResponse)
-		
-		if pingResponse contains "1 packets transmitted, 1 packets received" then
-			set pingSuccess to true
-			debugOutput("Network ping successful for " & receiverIP)
-		else
-			set errorMessage to "Network ping failed: " & pingResponse
-			debugOutput("Network ping failed for " & receiverIP & ": " & pingResponse)
-			-- Return early with just ping results
-			return {reachable:pingSuccess, apiAvailable:apiSuccess, message:errorMessage}
-		end if
-	on error pingErr
-		set errorMessage to "Network error: " & pingErr
-		debugOutput("Network ping error for " & receiverIP & ": " & pingErr)
-		-- Return early with just ping results
-		return {reachable:pingSuccess, apiAvailable:apiSuccess, message:errorMessage}
-	end try
-	
-	-- Only proceed to API check if ping was successful
-	if not pingSuccess then
-		return {reachable:pingSuccess, apiAvailable:apiSuccess, message:errorMessage}
+	if pingSuccess then
+		set availabilityResult's reachable to true
+		my debugOutput("Network ping successful for " & receiverIP)
+	else
+		set availabilityResult's message to "Network ping failed after " & pingAttempts & " attempts"
+		my debugOutput(availabilityResult's message)
+		return availabilityResult
 	end if
 	
-	-- Debug timestamp before API check
-	debugOutput("Starting API ping check for " & receiverIP)
-	
 	-- Stage 2: Check API availability with strict timeout
+	my debugOutput("Starting API ping check for " & receiverIP & "...")
+	
 	try
 		set apiPingURL to "http://" & receiverIP & "/mwapi?method=ping"
-		-- Force a very short timeout to avoid hanging
+		-- Force a short timeout to avoid hanging
 		set curlCmd to "curl --max-time 2 --connect-timeout 1 --silent " & quoted form of apiPingURL & " || echo '{\"status\":\"timeout\"}'"
 		
-		debugOutput("Running curl command: " & curlCmd)
-		
+		my debugOutput("Running curl command: " & curlCmd)
 		set apiResponse to do shell script curlCmd
 		
 		-- Log raw response for debugging
-		debugOutput("Raw API response for " & receiverIP & ": " & apiResponse)
+		my debugOutput("Raw API response for " & receiverIP & ": " & apiResponse)
 		
 		-- Verify it's a valid response
 		set isValidResponse to false
 		try
 			set jqCmd to "echo " & quoted form of apiResponse & " | " & jqPath & " '.status' 2>/dev/null || echo 'parse_error'"
-			debugOutput("Running jq command: " & jqCmd)
+			my debugOutput("Running jq command: " & jqCmd)
 			
 			set statusCheck to do shell script jqCmd
-			debugOutput("Status check result: " & statusCheck)
+			my debugOutput("Status check result: " & statusCheck)
 			
 			if statusCheck as text is "0" then
 				set isValidResponse to true
@@ -755,78 +798,67 @@ on checkReceiverAvailability(receiverIP, jqPath)
 		end try
 		
 		if isValidResponse then
-			set apiSuccess to true
-			set errorMessage to "Receiver available"
-			debugOutput("API ping successful for " & receiverIP)
+			set availabilityResult's apiAvailable to true
+			set availabilityResult's message to "Receiver available"
+			my debugOutput("API ping successful for " & receiverIP)
 		else
-			set errorMessage to "API ping failed: Invalid response - " & apiResponse
-			debugOutput("API ping failed for " & receiverIP & ": Invalid response - " & apiResponse)
+			set availabilityResult's message to "API ping failed: Invalid response - " & apiResponse
+			my debugOutput("API ping failed for " & receiverIP & ": Invalid response - " & apiResponse)
 		end if
 	on error apiErr
-		set errorMessage to "API error: " & apiErr
-		debugOutput("API ping error for " & receiverIP & ": " & apiErr)
+		set availabilityResult's message to "API error: " & apiErr
+		my debugOutput("API ping error for " & receiverIP & ": " & apiErr)
 	end try
 	
-	debugOutput("Completed availability check for " & receiverIP)
-	
-	-- Create and return final result record
-	return {reachable:pingSuccess, apiAvailable:apiSuccess, message:errorMessage}
+	my debugOutput("Completed availability check for " & receiverIP)
+	return availabilityResult
 end checkReceiverAvailability
 
 
--- Login to receiver and capture session cookie
+-- Login to receiver and return both response and session cookie
 on loginToReceiver(receiverIP, userName, userPW, connectTimeout)
 	set loginURL to "http://" & receiverIP & "/mwapi?method=login&id=" & userName & "&pass=" & userPW
 	
-	-- Get the login response with headers
+	-- Capture the cookie data from curl
 	set loginCmd to "curl -i --connect-timeout " & connectTimeout & " --max-time " & (connectTimeout * 2) & " --silent " & quoted form of loginURL
-	debugOutput("Login command: " & loginCmd)
+	my debugOutput("Login command: " & loginCmd)
 	set fullLoginResponse to do shell script loginCmd
 	
-	-- Log the complete response for debugging
-	debugOutput("Full login response: " & fullLoginResponse)
-	
 	-- Extract the session ID from the Set-Cookie header
+	set sessionID to ""
+	set sessionCookie to ""
+	
 	try
 		set cookieCmd to "echo " & quoted form of fullLoginResponse & " | grep -i 'Set-Cookie:' | awk -F'[=;]' '{print $2}'"
 		set sessionID to do shell script cookieCmd
-		debugOutput("Extracted session ID: " & sessionID)
+		my debugOutput("Extracted session ID: " & sessionID)
 		
-		-- Store the cookie in the correct format
 		if sessionID is not "" then
 			set sessionCookie to "sid=" & sessionID
-			debugOutput("Set cookie to: " & sessionCookie)
-			-- Return success response since we got a session ID
-			return "{\"status\": 0}"
+			my debugOutput("Set cookie to: " & sessionCookie)
 		else
-			set sessionCookie to ""
-			debugOutput("No session ID found in response.")
-			-- Return error if no session ID found
-			return "{\"status\": -1, \"error\": \"No session ID in response\"}"
+			my debugOutput("No session ID found in response")
 		end if
 	on error cookieErr
-		set sessionCookie to ""
-		debugOutput("Error extracting cookie: " & cookieErr)
-		-- Return error for extraction failure
-		return "{\"status\": -1, \"error\": \"Failed to extract cookie: " & cookieErr & "\"}"
+		my debugOutput("Error extracting cookie: " & cookieErr)
 	end try
+	
+	-- Return a record with both the login response and the session cookie
+	return {response:"{\"status\": 0}", cookie:sessionCookie}
 end loginToReceiver
 
 
 -- Process a single receiver and return the result
-on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
+on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath, pingTimeout, pingAttempts, pingWaitTime)
 	my debugOutput("Starting to process receiver: " & receiverIP)
 	
 	-- Initialize a result record
 	set receiverResult to {receiver:receiverIP, status:"", source:""}
 	
-	-- Reset session cookie for each new receiver
-	set sessionCookie to ""
-	
 	try
 		-- (A) Check if receiver is available (both network and API)
 		my debugOutput("STEP A: Checking receiver availability for " & receiverIP)
-		set availabilityStatus to checkReceiverAvailability(receiverIP, jqPath)
+		set availabilityStatus to checkReceiverAvailability(receiverIP, jqPath, pingTimeout, pingAttempts, pingWaitTime)
 		
 		if not availabilityStatus's reachable then
 			set receiverResult's status to "Unreachable (network ping failed)"
@@ -840,16 +872,19 @@ on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
 			error "Skipping receiver " & receiverIP & " - API unavailable"
 		end if
 		
-		-- (B) Login to the receiver using the new session cookie management
+		-- (B) Login to the receiver to get a session cookie
 		my debugOutput("STEP B: Logging in to " & receiverIP)
-		set loginResponse to loginToReceiver(receiverIP, userName, userPW, connectTimeout)
+		set loginResult to loginToReceiver(receiverIP, userName, userPW, connectTimeout)
+		set loginResponse to loginResult's response
+		set sessionCookie to loginResult's cookie
+		
 		my debugOutput("Login Response for " & receiverIP & ": " & loginResponse)
 		my checkResponse(loginResponse, "Login failed for receiver " & receiverIP, jqPath)
 		
 		-- (C) Retrieve the list of available sources using session cookie
 		my debugOutput("STEP C: Retrieving sources from " & receiverIP)
 		set getSourcesURL to "http://" & receiverIP & "/mwapi?method=get-ndi-sources"
-		set jsonResponse to runCURLWithSession(getSourcesURL, connectTimeout)
+		set jsonResponse to runCURLWithSession(getSourcesURL, connectTimeout, sessionCookie)
 		my debugOutput("JSON Response for " & receiverIP & ": " & jsonResponse)
 		my checkResponse(jsonResponse, "Failed to retrieve sources for receiver " & receiverIP, jqPath)
 		
@@ -861,7 +896,7 @@ on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
 			-- (E) Set the receiver's channel to the found source
 			my debugOutput("STEP E: Setting channel for " & receiverIP)
 			set setChannelURL to "http://" & receiverIP & "/mwapi?method=set-channel&ndi-name=true&name=" & sourceResult's encodedName
-			set setChannelResponse to runCURLWithSession(setChannelURL, connectTimeout)
+			set setChannelResponse to runCURLWithSession(setChannelURL, connectTimeout, sessionCookie)
 			my debugOutput("Set Channel Response for " & receiverIP & ": " & setChannelResponse)
 			my checkResponse(setChannelResponse, "Set channel for receiver " & receiverIP, jqPath)
 			
@@ -875,7 +910,7 @@ on processReceiver(receiverIP, userName, userPW, connectTimeout, jqPath)
 		-- (F) Logout from the receiver
 		my debugOutput("STEP F: Logging out from " & receiverIP)
 		set logoutURL to "http://" & receiverIP & "/mwapi?method=logout"
-		runCURLWithSession(logoutURL, connectTimeout)
+		runCURLWithSession(logoutURL, connectTimeout, sessionCookie)
 		
 	on error errMsg
 		my debugOutput("ERROR processing receiver " & receiverIP & ": " & errMsg)
@@ -888,16 +923,17 @@ end processReceiver
 
 -- Find a matching NDI source for the given receiver
 on findMatchingSource(jsonResponse, receiverIP, jqPath)
-	-- Create the result record with default values
+	-- Create the result record
 	set sourceResult to {found:false, sourceName:"", encodedName:""}
 	
-	-- Use jq to filter sources for the desired receiver IP
-	set jqQuery to ".sources[] | select(.\"ndi-name\" | contains(\"" & receiverIP & "\"))"
+	-- Use jq with regex to ensure exact IP match
+	-- This matches IPs that are surrounded by non-digits or at string boundaries
+	set jqQuery to ".sources[] | select(.\"ndi-name\" | test(\"[^0-9]" & receiverIP & "[^0-9]|^" & receiverIP & "[^0-9]|[^0-9]" & receiverIP & "$|^" & receiverIP & "$\"))"
 	set targetSourceRaw to do shell script "echo " & quoted form of jsonResponse & " | " & jqPath & " '" & jqQuery & "'"
 	my debugOutput("jq target source for " & receiverIP & ": " & targetSourceRaw)
 	
 	if targetSourceRaw is not "" then
-		-- Extract the ndi-name field using jq and remove extra quotes
+		-- Process found source as before
 		set ndiNameRaw to do shell script "echo " & quoted form of targetSourceRaw & " | " & jqPath & " '.\"ndi-name\"' | tr -d '\"'"
 		my debugOutput("NDI Name for " & receiverIP & ": " & ndiNameRaw)
 		set encodedNdiName to urlEncode(ndiNameRaw)
@@ -913,17 +949,17 @@ on findMatchingSource(jsonResponse, receiverIP, jqPath)
 end findMatchingSource
 
 
--- Run curl command with session cookie
-on runCURLWithSession(theURL, connectTimeout)
-	if sessionCookie is "" then
+-- Run curl command with explicit session cookie
+on runCURLWithSession(theURL, connectTimeout, cookieValue)
+	if cookieValue is "" then
 		-- No cookie available, just run a simple curl command
 		set curlCmd to "curl --connect-timeout " & connectTimeout & " --max-time " & (connectTimeout * 2) & " --silent " & quoted form of theURL
-		debugOutput("Running curl command (no cookie): " & curlCmd)
+		my debugOutput("Running curl command (no cookie): " & curlCmd)
 		return do shell script curlCmd
 	else
-		-- Use the stored session cookie in the format "sid=SESSIONID"
-		set curlCmd to "curl --connect-timeout " & connectTimeout & " --max-time " & (connectTimeout * 2) & " --silent -b " & quoted form of sessionCookie & " " & quoted form of theURL
-		debugOutput("Running curl command (with cookie): " & curlCmd)
+		-- Use the provided session cookie
+		set curlCmd to "curl --connect-timeout " & connectTimeout & " --max-time " & (connectTimeout * 2) & " --silent -b " & quoted form of cookieValue & " " & quoted form of theURL
+		my debugOutput("Running curl command (with cookie): " & curlCmd)
 		return do shell script curlCmd
 	end if
 end runCURLWithSession
@@ -976,6 +1012,21 @@ on formatSeconds(totalSeconds)
 		return totalSeconds & " seconds"
 	end if
 end formatSeconds
+
+
+-- create joined list with delimiters
+on joinListWithDelimiter(theList, theDelimiter)
+	-- Save original delimiters
+	set oldDelimiters to AppleScript's text item delimiters
+	-- Set new delimiters
+	set AppleScript's text item delimiters to theDelimiter
+	-- Join the list
+	set joinedText to theList as text
+	-- Restore original delimiters
+	set AppleScript's text item delimiters to oldDelimiters
+	-- Return the result
+	return joinedText
+end joinListWithDelimiter
 
 
 -- Enhanced debug output function
